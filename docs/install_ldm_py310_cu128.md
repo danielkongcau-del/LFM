@@ -51,7 +51,7 @@ If you use the older Lightning `--gpus` form in PowerShell, quote comma-suffixed
 
 ## Dataset
 
-The worm dataset is intentionally ignored by git. Place it at:
+The entire `data/` directory is intentionally ignored by git. Place the worm dataset at:
 
 ```text
 data/worm/

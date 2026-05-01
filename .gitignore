@@ -1,4 +1,4 @@
-data/worm/
+data/
 logs/
 __pycache__/
 *.py[cod]
