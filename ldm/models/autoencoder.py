@@ -1,14 +1,37 @@
 import torch
 import pytorch_lightning as pl
 import torch.nn.functional as F
+import numpy as np
+import inspect
 from contextlib import contextmanager
+from packaging import version
+from torch.optim.lr_scheduler import LambdaLR
 
 from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
+from ldm.modules.ema import LitEma
 
 from ldm.util import instantiate_from_config
+
+
+def load_trusted_checkpoint(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def accepts_kwarg(fn, name):
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class VQModel(pl.LightningModule):
@@ -36,6 +59,7 @@ class VQModel(pl.LightningModule):
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
         self.loss = instantiate_from_config(lossconfig)
+        self.loss_accepts_predicted_indices = accepts_kwarg(self.loss.forward, "predicted_indices")
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25,
                                         remap=remap,
                                         sane_index_shape=sane_index_shape)
@@ -76,7 +100,7 @@ class VQModel(pl.LightningModule):
                     print(f"{context}: Restored training weights")
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        sd = load_trusted_checkpoint(path)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
@@ -139,6 +163,15 @@ class VQModel(pl.LightningModule):
             x = x.detach()
         return x
 
+    def _loss(self, qloss, x, xrec, optimizer_idx, split, predicted_indices=None):
+        kwargs = dict(
+            last_layer=self.get_last_layer(),
+            split=split,
+        )
+        if self.loss_accepts_predicted_indices and predicted_indices is not None:
+            kwargs["predicted_indices"] = predicted_indices
+        return self.loss(qloss, x, xrec, optimizer_idx, self.global_step, **kwargs)
+
     def training_step(self, batch, batch_idx, optimizer_idx):
         # https://github.com/pytorch/pytorch/issues/37142
         # try not to fool the heuristics
@@ -147,17 +180,14 @@ class VQModel(pl.LightningModule):
 
         if optimizer_idx == 0:
             # autoencode
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train",
-                                            predicted_indices=ind)
+            aeloss, log_dict_ae = self._loss(qloss, x, xrec, optimizer_idx, "train", predicted_indices=ind)
 
             self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
             return aeloss
 
         if optimizer_idx == 1:
             # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
+            discloss, log_dict_disc = self._loss(qloss, x, xrec, optimizer_idx, "train")
             self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
             return discloss
 
@@ -170,19 +200,9 @@ class VQModel(pl.LightningModule):
     def _validation_step(self, batch, batch_idx, suffix=""):
         x = self.get_input(batch, self.image_key)
         xrec, qloss, ind = self(x, return_pred_indices=True)
-        aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0,
-                                        self.global_step,
-                                        last_layer=self.get_last_layer(),
-                                        split="val"+suffix,
-                                        predicted_indices=ind
-                                        )
+        aeloss, log_dict_ae = self._loss(qloss, x, xrec, 0, "val"+suffix, predicted_indices=ind)
 
-        discloss, log_dict_disc = self.loss(qloss, x, xrec, 1,
-                                            self.global_step,
-                                            last_layer=self.get_last_layer(),
-                                            split="val"+suffix,
-                                            predicted_indices=ind
-                                            )
+        discloss, log_dict_disc = self._loss(qloss, x, xrec, 1, "val"+suffix, predicted_indices=ind)
         rec_loss = log_dict_ae[f"val{suffix}/rec_loss"]
         self.log(f"val{suffix}/rec_loss", rec_loss,
                    prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
@@ -311,7 +331,7 @@ class AutoencoderKL(pl.LightningModule):
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        sd = load_trusted_checkpoint(path)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:

@@ -12,6 +12,7 @@ pillow>=10
 numpy>=1.26,<3
 tqdm>=4.67
 packaging>=23
+requests>=2.31
 lpips>=0.1.4
 # Required for original VQ first-stage models and pretrained VQ checkpoints.
 git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers

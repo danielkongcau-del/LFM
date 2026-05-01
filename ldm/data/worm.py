@@ -12,14 +12,15 @@ class WormPairsBase(Dataset):
             self,
             root="data/worm",
             split="train",
-            size=256,
+            size=None,
+            crop_size=None,
             random_crop=False,
             flip_p=0.0,
             interpolation="bicubic",
     ):
         self.root = root
         self.split = split
-        self.size = size
+        self.size = size if size is not None else (crop_size if crop_size is not None else 256)
         self.random_crop = random_crop
         self.flip_p = flip_p
         self.image_dir = os.path.join(root, split, "image")

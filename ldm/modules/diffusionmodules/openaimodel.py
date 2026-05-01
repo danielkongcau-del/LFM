@@ -312,7 +312,7 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        return checkpoint(self._forward, (x,), self.parameters(), self.use_checkpoint)
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):
@@ -740,6 +740,171 @@ class UNetModel(nn.Module):
             return self.id_predictor(h)
         else:
             return self.out(h)
+
+
+class CrossModalGatedFusion(nn.Module):
+    """
+    Split image and mask latents into modality-specific stems, then let each
+    modality control how much information it receives from the other.
+    """
+
+    def __init__(
+        self,
+        image_channels,
+        mask_channels,
+        hidden_channels,
+        out_channels,
+        dims=2,
+    ):
+        super().__init__()
+        self.image_stem = self._make_stem(dims, image_channels, hidden_channels)
+        self.mask_stem = self._make_stem(dims, mask_channels, hidden_channels)
+
+        gate_channels = hidden_channels * 2
+        self.mask_to_image_gate = nn.Sequential(
+            conv_nd(dims, gate_channels, hidden_channels, 1),
+            nn.Sigmoid(),
+        )
+        self.image_to_mask_gate = nn.Sequential(
+            conv_nd(dims, gate_channels, hidden_channels, 1),
+            nn.Sigmoid(),
+        )
+
+        self.mask_to_image = zero_module(conv_nd(dims, hidden_channels, hidden_channels, 3, padding=1))
+        self.image_to_mask = zero_module(conv_nd(dims, hidden_channels, hidden_channels, 3, padding=1))
+
+        self.fuse = nn.Sequential(
+            conv_nd(dims, gate_channels, out_channels, 1),
+            nn.SiLU(),
+            conv_nd(dims, out_channels, out_channels, 3, padding=1),
+        )
+
+    @staticmethod
+    def _make_stem(dims, in_channels, out_channels):
+        return nn.Sequential(
+            conv_nd(dims, in_channels, out_channels, 3, padding=1),
+            nn.SiLU(),
+            conv_nd(dims, out_channels, out_channels, 3, padding=1),
+        )
+
+    def forward(self, image_x, mask_x):
+        image_h = self.image_stem(image_x)
+        mask_h = self.mask_stem(mask_x)
+        joint_h = th.cat([image_h, mask_h], dim=1)
+
+        image_update = self.mask_to_image_gate(joint_h) * self.mask_to_image(mask_h)
+        mask_update = self.image_to_mask_gate(joint_h) * self.image_to_mask(image_h)
+        image_h = image_h + image_update
+        mask_h = mask_h + mask_update
+        return self.fuse(th.cat([image_h, mask_h], dim=1))
+
+
+class WormGatedFusionUNetModel(nn.Module):
+    """
+    U-Net variant for joint worm image/mask latent diffusion.
+
+    It keeps the external diffusion interface identical to UNetModel: input and
+    output are still joint latents of shape [B, image_channels + mask_channels, H, W].
+    Internally, the input is split into image and mask branches, fused with
+    cross-modal gates, and then passed to a standard UNetModel trunk.
+    """
+
+    def __init__(
+        self,
+        image_size,
+        in_channels,
+        model_channels,
+        out_channels,
+        num_res_blocks,
+        attention_resolutions,
+        dropout=0,
+        channel_mult=(1, 2, 4, 8),
+        conv_resample=True,
+        dims=2,
+        num_classes=None,
+        use_checkpoint=False,
+        use_fp16=False,
+        num_heads=-1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=False,
+        resblock_updown=False,
+        use_new_attention_order=False,
+        use_spatial_transformer=False,
+        transformer_depth=1,
+        context_dim=None,
+        n_embed=None,
+        legacy=True,
+        image_channels=3,
+        mask_channels=4,
+        fusion_channels=None,
+        fusion_hidden_channels=None,
+    ):
+        super().__init__()
+        expected_channels = image_channels + mask_channels
+        if in_channels != expected_channels:
+            raise ValueError(
+                "WormGatedFusionUNetModel expected in_channels={} from image_channels + mask_channels, got {}".format(
+                    expected_channels, in_channels
+                )
+            )
+
+        self.image_channels = image_channels
+        self.mask_channels = mask_channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.dtype = th.float16 if use_fp16 else th.float32
+
+        fusion_channels = fusion_channels or model_channels
+        fusion_hidden_channels = fusion_hidden_channels or model_channels
+        self.cross_modal_fusion = CrossModalGatedFusion(
+            image_channels=image_channels,
+            mask_channels=mask_channels,
+            hidden_channels=fusion_hidden_channels,
+            out_channels=fusion_channels,
+            dims=dims,
+        )
+        self.unet = UNetModel(
+            image_size=image_size,
+            in_channels=fusion_channels,
+            model_channels=model_channels,
+            out_channels=out_channels,
+            num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            dropout=dropout,
+            channel_mult=channel_mult,
+            conv_resample=conv_resample,
+            dims=dims,
+            num_classes=num_classes,
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+            use_spatial_transformer=use_spatial_transformer,
+            transformer_depth=transformer_depth,
+            context_dim=context_dim,
+            n_embed=n_embed,
+            legacy=legacy,
+        )
+
+    def convert_to_fp16(self):
+        self.cross_modal_fusion.apply(convert_module_to_f16)
+        self.unet.convert_to_fp16()
+
+    def convert_to_fp32(self):
+        self.cross_modal_fusion.apply(convert_module_to_f32)
+        self.unet.convert_to_fp32()
+
+    def forward(self, x, timesteps=None, context=None, y=None, **kwargs):
+        x = x.type(self.dtype)
+        image_x = x[:, :self.image_channels]
+        mask_x = x[:, self.image_channels:self.image_channels + self.mask_channels]
+        fused_x = self.cross_modal_fusion(image_x, mask_x)
+        return self.unet(fused_x, timesteps=timesteps, context=context, y=y, **kwargs)
 
 
 class EncoderUNetModel(nn.Module):

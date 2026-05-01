@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
@@ -145,6 +146,30 @@ def count_configured_gpus(gpus):
         return len(gpus)
     except TypeError:
         return 0
+
+
+def pop_trainer_strategy(trainer_config):
+    if trainer_config.get("strategy") == "ddp_find_unused_parameters_true":
+        del trainer_config["strategy"]
+        return DDPStrategy(find_unused_parameters=True)
+    return None
+
+
+def add_local_import_paths():
+    roots = []
+    for root in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+        if root not in roots:
+            roots.append(root)
+
+    for root in reversed(roots):
+        if root in sys.path:
+            sys.path.remove(root)
+        sys.path.insert(0, root)
+
+    for root in roots:
+        taming_path = os.path.join(root, "taming-transformers")
+        if os.path.isdir(os.path.join(taming_path, "taming")) and taming_path not in sys.path:
+            sys.path.append(taming_path)
 
 
 class WrappedDataset(Dataset):
@@ -307,7 +332,7 @@ class SetupCallback(Callback):
 class ImageLogger(Callback):
     def __init__(self, batch_frequency, max_images, clamp=True, increase_log_steps=True,
                  rescale=True, disabled=False, log_on_batch_idx=False, log_first_step=False,
-                 log_images_kwargs=None):
+                 log_images_kwargs=None, latest_only=True, log_validation_first_batch_only=True):
         super().__init__()
         self.rescale = rescale
         self.batch_freq = batch_frequency
@@ -320,6 +345,8 @@ class ImageLogger(Callback):
         self.log_on_batch_idx = log_on_batch_idx
         self.log_images_kwargs = log_images_kwargs if log_images_kwargs else {}
         self.log_first_step = log_first_step
+        self.latest_only = latest_only
+        self.log_validation_first_batch_only = log_validation_first_batch_only
 
     def _to_pil(self, tensor):
         tensor = tensor.detach().cpu()
@@ -341,8 +368,10 @@ class ImageLogger(Callback):
         labels = {
             "inputs_image": "Original image",
             "reconstructions_image": "Reconstructed image",
+            "samples_image": "Sampled image",
             "inputs_mask": "Original mask",
             "reconstructions_mask": "Reconstructed mask",
+            "samples_mask": "Sampled mask",
         }
         return labels.get(key, key.replace("_", " ").capitalize())
 
@@ -350,8 +379,10 @@ class ImageLogger(Callback):
         preferred_keys = [
             "inputs_image",
             "reconstructions_image",
+            "samples_image",
             "inputs_mask",
             "reconstructions_mask",
+            "samples_mask",
         ]
         keys = [key for key in preferred_keys if key in images]
         if not keys:
@@ -414,7 +445,31 @@ class ImageLogger(Callback):
         filename = "{}_comparison.png".format(split)
         path = os.path.join(root, filename)
         os.makedirs(os.path.split(path)[0], exist_ok=True)
-        sheet.save(path)
+        if self.latest_only:
+            self._cleanup_old_local_images(root, split, keep_path=path)
+        tmp_path = path + ".tmp.png"
+        sheet.save(tmp_path, format="PNG")
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _cleanup_old_local_images(root, split, keep_path):
+        keep_path = os.path.abspath(keep_path)
+        if not os.path.isdir(root):
+            return
+
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            if os.path.abspath(path) == keep_path:
+                continue
+            if os.path.isfile(path) and name.startswith(split + "_") and name.lower().endswith(".png"):
+                os.remove(path)
+
+        legacy_split_dir = os.path.join(root, split)
+        if os.path.isdir(legacy_split_dir):
+            for name in os.listdir(legacy_split_dir):
+                path = os.path.join(legacy_split_dir, name)
+                if os.path.isfile(path) and name.lower().endswith(".png"):
+                    os.remove(path)
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         trainer = getattr(pl_module, "trainer", None)
@@ -466,7 +521,8 @@ class ImageLogger(Callback):
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         if not self.disabled and pl_module.global_step > 0:
-            self.log_img(pl_module, batch, batch_idx, split="val")
+            if not self.log_validation_first_batch_only or batch_idx == 0:
+                self.log_img(pl_module, batch, batch_idx, split="val")
         if hasattr(pl_module, 'calibrate_grad_norm'):
             if (pl_module.calibrate_grad_norm and batch_idx % 25 == 0) and batch_idx > 0:
                 self.log_gradients(trainer, pl_module, batch_idx=batch_idx)
@@ -561,7 +617,7 @@ if __name__ == "__main__":
     # add cwd for convenience and to make classes in this file available when
     # running as `python main.py`
     # (in particular `main.DataModuleFromConfig`)
-    sys.path.append(os.getcwd())
+    add_local_import_paths()
 
     parser = get_parser()
     parser = Trainer.add_argparse_args(parser)
@@ -603,7 +659,7 @@ if __name__ == "__main__":
         run_name = run_name + opt.postfix
         nowname = run_name
         base_parts = [part.lower() for part in os.path.normpath(opt.base[0]).split(os.sep)] if opt.base else []
-        if "autoencoder" in base_parts:
+        if "autoencoder" in base_parts or "first_stage_models" in base_parts:
             logdir = os.path.join(opt.logdir, "autoencoder", run_name)
         else:
             logdir = os.path.join(opt.logdir, run_name)
@@ -611,6 +667,7 @@ if __name__ == "__main__":
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed)
+    trainer = None
 
     try:
         # init and save configs
@@ -643,6 +700,7 @@ if __name__ == "__main__":
                 ngpu = 1
                 if trainer_config.get("accelerator") == "gpu":
                     del trainer_config["accelerator"]
+        trainer_strategy = pop_trainer_strategy(trainer_config)
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
@@ -651,6 +709,8 @@ if __name__ == "__main__":
 
         # trainer and callbacks
         trainer_kwargs = dict()
+        if trainer_strategy is not None:
+            trainer_kwargs["strategy"] = trainer_strategy
 
         # default logger configs
         default_logger_cfgs = {
@@ -838,7 +898,7 @@ if __name__ == "__main__":
         if not opt.no_test and not trainer.interrupted:
             trainer.test(model, data)
     except Exception:
-        if opt.debug and trainer.global_rank == 0:
+        if opt.debug and trainer is not None and trainer.global_rank == 0:
             try:
                 import pudb as debugger
             except ImportError:
@@ -847,10 +907,10 @@ if __name__ == "__main__":
         raise
     finally:
         # move newly created debug project to debug_runs
-        if opt.debug and not opt.resume and trainer.global_rank == 0:
+        if opt.debug and not opt.resume and trainer is not None and trainer.global_rank == 0:
             dst, name = os.path.split(logdir)
             dst = os.path.join(dst, "debug_runs", name)
             os.makedirs(os.path.split(dst)[0], exist_ok=True)
             os.rename(logdir, dst)
-        if trainer.global_rank == 0:
+        if trainer is not None and trainer.global_rank == 0:
             print(trainer.profiler.summary())

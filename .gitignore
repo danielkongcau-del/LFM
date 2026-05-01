@@ -3,5 +3,6 @@ logs/
 __pycache__/
 *.py[cod]
 *.egg-info/
+taming-transformers/
 models/first_stage_models/*/model.ckpt
 models/first_stage_models/*/model.zip
