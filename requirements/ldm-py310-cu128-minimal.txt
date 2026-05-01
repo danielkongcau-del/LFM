@@ -1,0 +1,14 @@
+# Install torch and torchvision first with the CUDA 12.8 PyTorch index:
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+# This file intentionally avoids the legacy pinned dependencies from
+# environment.yaml that conflict with Python 3.10 and current wheels.
+pytorch-lightning==1.9.5
+omegaconf==2.3.0
+einops==0.8.2
+tensorboard>=2.20
+PyYAML>=6.0
+pillow>=10
+numpy>=1.26,<3
+tqdm>=4.67
+packaging>=23

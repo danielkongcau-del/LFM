@@ -130,6 +130,24 @@ def nondefault_trainer_args(opt):
     return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
 
 
+def count_configured_gpus(gpus):
+    if gpus in (None, "", 0, "0"):
+        return 0
+    if isinstance(gpus, int):
+        return torch.cuda.device_count() if gpus == -1 else max(gpus, 0)
+    if isinstance(gpus, str):
+        gpus = gpus.strip()
+        if not gpus:
+            return 0
+        if gpus == "-1":
+            return torch.cuda.device_count()
+        return len([gpu for gpu in gpus.strip(",").split(",") if gpu.strip()])
+    try:
+        return len(gpus)
+    except TypeError:
+        return 0
+
+
 class WrappedDataset(Dataset):
     """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
 
@@ -254,7 +272,7 @@ class SetupCallback(Callback):
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
-    def on_pretrain_routine_start(self, trainer, pl_module):
+    def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
             # Create logdirs and save configs
             os.makedirs(self.logdir, exist_ok=True)
@@ -294,9 +312,11 @@ class ImageLogger(Callback):
         self.rescale = rescale
         self.batch_freq = batch_frequency
         self.max_images = max_images
-        self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
-        }
+        self.logger_log_images = {}
+        if hasattr(pl.loggers, "TestTubeLogger"):
+            self.logger_log_images[pl.loggers.TestTubeLogger] = self._tensorboard
+        if hasattr(pl.loggers, "TensorBoardLogger"):
+            self.logger_log_images[pl.loggers.TensorBoardLogger] = self._tensorboard
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
@@ -307,7 +327,7 @@ class ImageLogger(Callback):
         self.log_first_step = log_first_step
 
     @rank_zero_only
-    def _testtube(self, pl_module, images, batch_idx, split):
+    def _tensorboard(self, pl_module, images, batch_idx, split):
         for k in images:
             grid = torchvision.utils.make_grid(images[k])
             grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
@@ -380,7 +400,7 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=None):
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
             self.log_img(pl_module, batch, batch_idx, split="train")
 
@@ -394,20 +414,39 @@ class ImageLogger(Callback):
 
 class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
+    @staticmethod
+    def _cuda_device(trainer):
+        if not torch.cuda.is_available():
+            return None
+        device = getattr(getattr(trainer, "strategy", None), "root_device", None)
+        if device is not None and getattr(device, "type", None) == "cuda":
+            return device
+        if hasattr(trainer, "root_gpu"):
+            return trainer.root_gpu
+        return None
+
     def on_train_epoch_start(self, trainer, pl_module):
+        device = self._cuda_device(trainer)
+        if device is None:
+            self.start_time = time.time()
+            return
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module, outputs=None):
+        device = self._cuda_device(trainer)
+        if device is None:
+            return
+        torch.cuda.synchronize(device)
+        max_memory = torch.cuda.max_memory_allocated(device) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            plugin = getattr(trainer, "training_type_plugin", None) or getattr(trainer, "strategy", None)
+            max_memory = plugin.reduce(max_memory)
+            epoch_time = plugin.reduce(epoch_time)
 
             rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
             rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
@@ -517,17 +556,27 @@ if __name__ == "__main__":
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        trainer_config["accelerator"] = "ddp"
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         if not "gpus" in trainer_config:
-            del trainer_config["accelerator"]
             cpu = True
+            ngpu = 1
         else:
             gpuinfo = trainer_config["gpus"]
-            print(f"Running on GPUs {gpuinfo}")
-            cpu = False
+            ngpu = count_configured_gpus(gpuinfo)
+            if ngpu > 0:
+                print(f"Running on GPUs {gpuinfo}")
+                cpu = False
+                if trainer_config.get("accelerator") in (None, "ddp"):
+                    trainer_config["accelerator"] = "gpu"
+                if ngpu > 1 and "strategy" not in trainer_config:
+                    trainer_config["strategy"] = "ddp"
+            else:
+                print("gpus=0 means CPU execution. In PowerShell, quote GPU ids as --gpus \"0,\" or use --accelerator gpu --devices 1.")
+                cpu = True
+                ngpu = 1
+                if trainer_config.get("accelerator") == "gpu":
+                    del trainer_config["accelerator"]
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
@@ -548,15 +597,15 @@ if __name__ == "__main__":
                     "id": nowname,
                 }
             },
-            "testtube": {
-                "target": "pytorch_lightning.loggers.TestTubeLogger",
+            "tensorboard": {
+                "target": "pytorch_lightning.loggers.TensorBoardLogger",
                 "params": {
-                    "name": "testtube",
+                    "name": "tensorboard",
                     "save_dir": logdir,
                 }
             },
         }
-        default_logger_cfg = default_logger_cfgs["testtube"]
+        default_logger_cfg = default_logger_cfgs["tensorboard"]
         if "logger" in lightning_config:
             logger_cfg = lightning_config.logger
         else:
@@ -672,10 +721,6 @@ if __name__ == "__main__":
 
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
-        if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
-        else:
-            ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:
             accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches
         else:
@@ -710,8 +755,10 @@ if __name__ == "__main__":
 
         import signal
 
-        signal.signal(signal.SIGUSR1, melk)
-        signal.signal(signal.SIGUSR2, divein)
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, melk)
+        if hasattr(signal, "SIGUSR2"):
+            signal.signal(signal.SIGUSR2, divein)
 
         # run
         if opt.train:
