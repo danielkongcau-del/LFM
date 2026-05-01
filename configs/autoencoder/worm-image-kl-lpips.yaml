@@ -1,0 +1,49 @@
+model:
+  base_learning_rate: 4.5e-6
+  target: ldm.models.worm_autoencoder.WormImageAutoencoderKL
+  params:
+    monitor: val/rec_loss
+    embed_dim: 4
+    kl_weight: 1.0e-6
+    l1_weight: 1.0
+    perceptual_weight: 1.0
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 0
+    wrap: false
+    train:
+      target: ldm.data.worm.WormPairsTrain
+      params:
+        root: data/worm
+        size: 256
+    validation:
+      target: ldm.data.worm.WormPairsValidation
+      params:
+        root: data/worm
+        size: 256
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 500
+        max_images: 4
+        increase_log_steps: false
+
+  trainer:
+    benchmark: true

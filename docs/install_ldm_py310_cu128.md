@@ -25,6 +25,7 @@ pip install -e .
 ```
 
 Do not install the original `environment.yaml` as-is for this workflow. Its old pins include packages that either lack Python 3.10 wheels or pull obsolete build chains.
+The minimal requirements include `lpips` for the image-only worm autoencoder and `taming-transformers` for original VQ first-stage models.
 
 ## Validation
 

@@ -3,3 +3,5 @@ logs/
 __pycache__/
 *.py[cod]
 *.egg-info/
+models/first_stage_models/*/model.ckpt
+models/first_stage_models/*/model.zip
