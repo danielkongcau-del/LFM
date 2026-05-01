@@ -629,7 +629,7 @@ if __name__ == "__main__":
                 if trainer_config.get("accelerator") in (None, "ddp"):
                     trainer_config["accelerator"] = "gpu"
                 if ngpu > 1 and "strategy" not in trainer_config:
-                    trainer_config["strategy"] = "ddp"
+                    trainer_config["strategy"] = "ddp_find_unused_parameters_false"
             else:
                 print("gpus=0 means CPU execution. In PowerShell, quote GPU ids as --gpus \"0,\" or use --accelerator gpu --devices 1.")
                 cpu = True
