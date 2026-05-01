@@ -281,6 +281,9 @@ class SetupCallback(Callback):
                 for pattern in ("best*.ckpt", "last.ckpt"):
                     for path in glob.glob(os.path.join(self.ckptdir, pattern)):
                         os.remove(path)
+            for pattern in ("*-project.yaml", "*-lightning.yaml"):
+                for path in glob.glob(os.path.join(self.cfgdir, pattern)):
+                    os.remove(path)
 
             if "callbacks" in self.lightning_config:
                 if 'metrics_over_trainsteps_checkpoint' in self.lightning_config['callbacks']:
@@ -288,12 +291,12 @@ class SetupCallback(Callback):
             print("Project config")
             print(OmegaConf.to_yaml(self.config))
             OmegaConf.save(self.config,
-                           os.path.join(self.cfgdir, "{}-project.yaml".format(self.now)))
+                           os.path.join(self.cfgdir, "project.yaml"))
 
             print("Lightning config")
             print(OmegaConf.to_yaml(self.lightning_config))
             OmegaConf.save(OmegaConf.create({"lightning": self.lightning_config}),
-                           os.path.join(self.cfgdir, "{}-lightning.yaml".format(self.now)))
+                           os.path.join(self.cfgdir, "lightning.yaml"))
 
         else:
             # In DDP all ranks share the same fixed log directory. Non-zero
