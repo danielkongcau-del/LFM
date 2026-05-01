@@ -2,14 +2,13 @@ import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import time
 import torch
-import torchvision
 import pytorch_lightning as pl
 
 from packaging import version
 from omegaconf import OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
 from functools import partial
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -278,6 +277,10 @@ class SetupCallback(Callback):
             os.makedirs(self.logdir, exist_ok=True)
             os.makedirs(self.ckptdir, exist_ok=True)
             os.makedirs(self.cfgdir, exist_ok=True)
+            if not self.resume:
+                for pattern in ("best*.ckpt", "last.ckpt"):
+                    for path in glob.glob(os.path.join(self.ckptdir, pattern)):
+                        os.remove(path)
 
             if "callbacks" in self.lightning_config:
                 if 'metrics_over_trainsteps_checkpoint' in self.lightning_config['callbacks']:
@@ -312,11 +315,6 @@ class ImageLogger(Callback):
         self.rescale = rescale
         self.batch_freq = batch_frequency
         self.max_images = max_images
-        self.logger_log_images = {}
-        if hasattr(pl.loggers, "TestTubeLogger"):
-            self.logger_log_images[pl.loggers.TestTubeLogger] = self._tensorboard
-        if hasattr(pl.loggers, "TensorBoardLogger"):
-            self.logger_log_images[pl.loggers.TensorBoardLogger] = self._tensorboard
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
             self.log_steps = [self.batch_freq]
@@ -326,36 +324,102 @@ class ImageLogger(Callback):
         self.log_images_kwargs = log_images_kwargs if log_images_kwargs else {}
         self.log_first_step = log_first_step
 
-    @rank_zero_only
-    def _tensorboard(self, pl_module, images, batch_idx, split):
-        for k in images:
-            grid = torchvision.utils.make_grid(images[k])
-            grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
+    def _to_pil(self, tensor):
+        tensor = tensor.detach().cpu()
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        if self.rescale:
+            tensor = (tensor + 1.0) / 2.0
+        tensor = torch.clamp(tensor, 0.0, 1.0)
+        if tensor.shape[0] == 1:
+            tensor = tensor.repeat(3, 1, 1)
+        elif tensor.shape[0] > 3:
+            tensor = tensor[:3]
+        array = tensor.permute(1, 2, 0).numpy()
+        array = (array * 255).astype(np.uint8)
+        return Image.fromarray(array)
 
-            tag = f"{split}/{k}"
-            pl_module.logger.experiment.add_image(
-                tag, grid,
-                global_step=pl_module.global_step)
+    @staticmethod
+    def _label_for_key(key):
+        labels = {
+            "inputs_image": "Original image",
+            "reconstructions_image": "Reconstructed image",
+            "inputs_mask": "Original mask",
+            "reconstructions_mask": "Reconstructed mask",
+        }
+        return labels.get(key, key.replace("_", " ").capitalize())
+
+    def _make_comparison_sheet(self, images, split, global_step):
+        preferred_keys = [
+            "inputs_image",
+            "reconstructions_image",
+            "inputs_mask",
+            "reconstructions_mask",
+        ]
+        keys = [key for key in preferred_keys if key in images]
+        if not keys:
+            keys = list(images.keys())
+
+        font = ImageFont.load_default()
+        padding = 8
+        label_width = 170
+        rows = []
+        sheet_width = 0
+
+        for key in keys:
+            batch = images[key]
+            if not isinstance(batch, torch.Tensor) or batch.ndim < 4:
+                continue
+            tiles = [self._to_pil(batch[i]) for i in range(batch.shape[0])]
+            if not tiles:
+                continue
+
+            tile_height = max(tile.height for tile in tiles)
+            tile_width = sum(tile.width for tile in tiles) + padding * (len(tiles) - 1)
+            row = Image.new("RGB", (label_width + tile_width + padding * 3, tile_height + padding * 2), "white")
+            draw = ImageDraw.Draw(row)
+            draw.rectangle((0, 0, row.width - 1, row.height - 1), outline=(210, 210, 210))
+            draw.text((padding, padding), self._label_for_key(key), fill=(0, 0, 0), font=font)
+
+            x = label_width + padding * 2
+            for tile in tiles:
+                y = padding + (tile_height - tile.height) // 2
+                row.paste(tile, (x, y))
+                draw.rectangle((x, y, x + tile.width - 1, y + tile.height - 1), outline=(160, 160, 160))
+                x += tile.width + padding
+
+            rows.append(row)
+            sheet_width = max(sheet_width, row.width)
+
+        if not rows:
+            return None
+
+        title_height = 28
+        sheet_height = title_height + padding + sum(row.height for row in rows) + padding * (len(rows) - 1)
+        sheet = Image.new("RGB", (sheet_width, sheet_height), (245, 245, 245))
+        draw = ImageDraw.Draw(sheet)
+        draw.text((padding, 7), f"{split} | global step {global_step}", fill=(0, 0, 0), font=font)
+
+        y = title_height + padding
+        for row in rows:
+            sheet.paste(row, (0, y))
+            y += row.height + padding
+        return sheet
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
                   global_step, current_epoch, batch_idx):
         root = os.path.join(save_dir, "images", split)
-        for k in images:
-            grid = torchvision.utils.make_grid(images[k], nrow=4)
-            if self.rescale:
-                grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
-            grid = grid.transpose(0, 1).transpose(1, 2).squeeze(-1)
-            grid = grid.numpy()
-            grid = (grid * 255).astype(np.uint8)
-            filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
-                k,
-                global_step,
-                current_epoch,
-                batch_idx)
-            path = os.path.join(root, filename)
-            os.makedirs(os.path.split(path)[0], exist_ok=True)
-            Image.fromarray(grid).save(path)
+        sheet = self._make_comparison_sheet(images, split, global_step)
+        if sheet is None:
+            return
+        filename = "comparison_gs-{:06}_e-{:06}_b-{:06}.png".format(
+            global_step,
+            current_epoch,
+            batch_idx)
+        path = os.path.join(root, filename)
+        os.makedirs(os.path.split(path)[0], exist_ok=True)
+        sheet.save(path)
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         check_idx = batch_idx if self.log_on_batch_idx else pl_module.global_step
@@ -363,8 +427,6 @@ class ImageLogger(Callback):
                 hasattr(pl_module, "log_images") and
                 callable(pl_module.log_images) and
                 self.max_images > 0):
-            logger = type(pl_module.logger)
-
             is_train = pl_module.training
             if is_train:
                 pl_module.eval()
@@ -380,11 +442,13 @@ class ImageLogger(Callback):
                     if self.clamp:
                         images[k] = torch.clamp(images[k], -1., 1.)
 
-            self.log_local(pl_module.logger.save_dir, split, images,
-                           pl_module.global_step, pl_module.current_epoch, batch_idx)
+            save_dir = getattr(getattr(pl_module, "trainer", None), "logdir", None)
+            if save_dir is None and pl_module.logger is not None:
+                save_dir = getattr(pl_module.logger, "save_dir", None)
+            save_dir = save_dir or "logs"
 
-            logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
-            logger_log_images(pl_module, images, pl_module.global_step, split)
+            self.log_local(save_dir, split, images,
+                           pl_module.global_step, pl_module.current_epoch, batch_idx)
 
             if is_train:
                 pl_module.train()
@@ -392,11 +456,8 @@ class ImageLogger(Callback):
     def check_frequency(self, check_idx):
         if ((check_idx % self.batch_freq) == 0 or (check_idx in self.log_steps)) and (
                 check_idx > 0 or self.log_first_step):
-            try:
+            if self.log_steps:
                 self.log_steps.pop(0)
-            except IndexError as e:
-                print(e)
-                pass
             return True
         return False
 
@@ -534,15 +595,19 @@ if __name__ == "__main__":
         nowname = _tmp[-1]
     else:
         if opt.name:
-            name = "_" + opt.name
+            run_name = opt.name
         elif opt.base:
             cfg_fname = os.path.split(opt.base[0])[-1]
-            cfg_name = os.path.splitext(cfg_fname)[0]
-            name = "_" + cfg_name
+            run_name = os.path.splitext(cfg_fname)[0]
         else:
-            name = ""
-        nowname = now + name + opt.postfix
-        logdir = os.path.join(opt.logdir, nowname)
+            run_name = "default"
+        run_name = run_name + opt.postfix
+        nowname = run_name
+        base_parts = [part.lower() for part in os.path.normpath(opt.base[0]).split(os.sep)] if opt.base else []
+        if "autoencoder" in base_parts:
+            logdir = os.path.join(opt.logdir, "autoencoder", run_name)
+        else:
+            logdir = os.path.join(opt.logdir, run_name)
 
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
@@ -597,15 +662,16 @@ if __name__ == "__main__":
                     "id": nowname,
                 }
             },
-            "tensorboard": {
-                "target": "pytorch_lightning.loggers.TensorBoardLogger",
+            "csv": {
+                "target": "pytorch_lightning.loggers.CSVLogger",
                 "params": {
-                    "name": "tensorboard",
                     "save_dir": logdir,
+                    "name": "",
+                    "version": "",
                 }
             },
         }
-        default_logger_cfg = default_logger_cfgs["tensorboard"]
+        default_logger_cfg = default_logger_cfgs["csv"]
         if "logger" in lightning_config:
             logger_cfg = lightning_config.logger
         else:
@@ -619,15 +685,16 @@ if __name__ == "__main__":
             "target": "pytorch_lightning.callbacks.ModelCheckpoint",
             "params": {
                 "dirpath": ckptdir,
-                "filename": "{epoch:06}",
+                "filename": "best",
                 "verbose": True,
                 "save_last": True,
+                "save_top_k": 1,
             }
         }
         if hasattr(model, "monitor"):
             print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["save_top_k"] = 3
+            default_modelckpt_cfg["params"]["mode"] = "min"
 
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint

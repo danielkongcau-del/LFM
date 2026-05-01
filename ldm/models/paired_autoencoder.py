@@ -222,7 +222,7 @@ class PairedAutoencoderKLBase(pl.LightningModule):
         outputs, posterior = self(image, mask, sample_posterior=False)
         loss, log_dict = self.paired_loss(image, mask, outputs, posterior, split="val")
         self.log("val/rec_loss", log_dict["val/rec_loss"], prog_bar=True, logger=True)
-        self.log_dict(log_dict, prog_bar=False, logger=True)
+        self.log_dict({k: v for k, v in log_dict.items() if k != "val/rec_loss"}, prog_bar=False, logger=True)
         return loss
 
     def configure_optimizers(self):
