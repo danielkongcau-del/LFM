@@ -349,7 +349,7 @@ class ImageLogger(Callback):
         }
         return labels.get(key, key.replace("_", " ").capitalize())
 
-    def _make_comparison_sheet(self, images, split, global_step):
+    def _make_comparison_sheet(self, images, split, global_step, current_epoch, batch_idx):
         preferred_keys = [
             "inputs_image",
             "reconstructions_image",
@@ -398,7 +398,8 @@ class ImageLogger(Callback):
         sheet_height = title_height + padding + sum(row.height for row in rows) + padding * (len(rows) - 1)
         sheet = Image.new("RGB", (sheet_width, sheet_height), (245, 245, 245))
         draw = ImageDraw.Draw(sheet)
-        draw.text((padding, 7), f"{split} | global step {global_step}", fill=(0, 0, 0), font=font)
+        title = f"{split} | global step {global_step} | epoch {current_epoch} | batch {batch_idx}"
+        draw.text((padding, 7), title, fill=(0, 0, 0), font=font)
 
         y = title_height + padding
         for row in rows:
@@ -409,14 +410,11 @@ class ImageLogger(Callback):
     @rank_zero_only
     def log_local(self, save_dir, split, images,
                   global_step, current_epoch, batch_idx):
-        root = os.path.join(save_dir, "images", split)
-        sheet = self._make_comparison_sheet(images, split, global_step)
+        root = os.path.join(save_dir, "images")
+        sheet = self._make_comparison_sheet(images, split, global_step, current_epoch, batch_idx)
         if sheet is None:
             return
-        filename = "comparison_gs-{:06}_e-{:06}_b-{:06}.png".format(
-            global_step,
-            current_epoch,
-            batch_idx)
+        filename = "{}_comparison.png".format(split)
         path = os.path.join(root, filename)
         os.makedirs(os.path.split(path)[0], exist_ok=True)
         sheet.save(path)
