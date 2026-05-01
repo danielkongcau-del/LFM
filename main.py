@@ -615,6 +615,8 @@ if __name__ == "__main__":
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
+        if "log_every_n_steps" not in trainer_config:
+            trainer_config["log_every_n_steps"] = 1
         if not "gpus" in trainer_config:
             cpu = True
             ngpu = 1

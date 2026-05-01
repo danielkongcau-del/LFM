@@ -211,18 +211,42 @@ class PairedAutoencoderKLBase(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         image, mask = self.get_input(batch)
+        batch_size = image.shape[0]
         outputs, posterior = self(image, mask)
         loss, log_dict = self.paired_loss(image, mask, outputs, posterior, split="train")
-        self.log("aeloss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log(
+            "aeloss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log_dict(log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch, batch_idx):
         image, mask = self.get_input(batch)
+        batch_size = image.shape[0]
         outputs, posterior = self(image, mask, sample_posterior=False)
         loss, log_dict = self.paired_loss(image, mask, outputs, posterior, split="val")
-        self.log("val/rec_loss", log_dict["val/rec_loss"], prog_bar=True, logger=True)
-        self.log_dict({k: v for k, v in log_dict.items() if k != "val/rec_loss"}, prog_bar=False, logger=True)
+        self.log(
+            "val/rec_loss",
+            log_dict["val/rec_loss"],
+            prog_bar=True,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log_dict(
+            {k: v for k, v in log_dict.items() if k != "val/rec_loss"},
+            prog_bar=False,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
         return loss
 
     def configure_optimizers(self):
