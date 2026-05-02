@@ -1,6 +1,7 @@
 import copy
 import functools
 import os
+import re
 
 import blobfile as bf
 import numpy as np
@@ -45,6 +46,7 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        keep_latest=False,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -65,6 +67,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.keep_latest = keep_latest
 
         self.step = 0
         self.resume_step = 0
@@ -269,6 +272,8 @@ class TrainLoop:
             logger.logkv("lg_loss_scale", self.lg_loss_scale)
 
     def save(self):
+        keep_filenames = []
+
         def save_checkpoint(rate, params):
             state_dict = self._master_params_to_state_dict(params)
             if dist.get_rank() == 0:
@@ -277,6 +282,7 @@ class TrainLoop:
                     filename = f"model{(self.step+self.resume_step):06d}.pt"
                 else:
                     filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
+                keep_filenames.append(filename)
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
@@ -285,13 +291,35 @@ class TrainLoop:
             save_checkpoint(rate, params)
 
         if dist.get_rank() == 0:
+            opt_filename = f"opt{(self.step+self.resume_step):06d}.pt"
+            keep_filenames.append(opt_filename)
             with bf.BlobFile(
-                bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
+                bf.join(get_blob_logdir(), opt_filename),
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)
+            if self.keep_latest:
+                self._cleanup_old_checkpoints(keep_filenames)
 
         dist.barrier()
+
+    @staticmethod
+    def _is_checkpoint_filename(name):
+        return (
+            re.fullmatch(r"model\d+\.pt", name) is not None
+            or re.fullmatch(r"ema_[^_]+_\d+\.pt", name) is not None
+            or re.fullmatch(r"opt\d+\.pt", name) is not None
+        )
+
+    def _cleanup_old_checkpoints(self, keep_filenames):
+        logdir = get_blob_logdir()
+        keep_filenames = set(keep_filenames)
+        for name in bf.listdir(logdir):
+            if name in keep_filenames or not self._is_checkpoint_filename(name):
+                continue
+            path = bf.join(logdir, name)
+            logger.log(f"removing old checkpoint: {path}")
+            bf.remove(path)
 
     def _master_params_to_state_dict(self, master_params):
         if self.use_fp16:

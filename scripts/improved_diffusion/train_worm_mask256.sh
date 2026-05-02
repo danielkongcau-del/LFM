@@ -15,6 +15,7 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
 LOG_INTERVAL="${LOG_INTERVAL:-50}"
 LR="${LR:-1e-4}"
 USE_FP16="${USE_FP16:-False}"
+KEEP_LATEST="${KEEP_LATEST:-True}"
 
 MODEL_FLAGS=(
   --image_size 256
@@ -39,11 +40,13 @@ TRAIN_FLAGS=(
   --save_interval "$SAVE_INTERVAL"
   --log_interval "$LOG_INTERVAL"
   --use_fp16 "$USE_FP16"
+  --keep_latest "$KEEP_LATEST"
 )
 
 echo "OPENAI_LOGDIR=$OPENAI_LOGDIR"
 echo "DATA_DIR=$DATA_DIR"
 echo "NUM_GPUS=$NUM_GPUS BATCH_SIZE_PER_RANK=$BATCH_SIZE MICROBATCH=$MICROBATCH"
+echo "SAVE_INTERVAL=$SAVE_INTERVAL KEEP_LATEST=$KEEP_LATEST"
 
 if [[ "$NUM_GPUS" -gt 1 ]]; then
   mpiexec -n "$NUM_GPUS" python third_party/improved-diffusion/scripts/image_train.py \

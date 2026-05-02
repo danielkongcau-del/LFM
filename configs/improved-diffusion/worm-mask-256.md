@@ -21,6 +21,7 @@ OPENAI_LOGDIR=logs/improved-diffusion/worm-mask-256 \
 DATA_DIR=data/worm-improved-diffusion-mask256/train \
 BATCH_SIZE=4 \
 MICROBATCH=1 \
+KEEP_LATEST=True \
 bash scripts/improved_diffusion/train_worm_mask256.sh
 ```
 
@@ -32,8 +33,12 @@ DATA_DIR=data/worm-improved-diffusion-mask256/train \
 NUM_GPUS=2 \
 BATCH_SIZE=4 \
 MICROBATCH=1 \
+KEEP_LATEST=True \
 bash scripts/improved_diffusion/train_worm_mask256.sh
 ```
+
+With `KEEP_LATEST=True`, each save removes older `model*.pt`, `ema_*.pt`, and
+`opt*.pt` files in `OPENAI_LOGDIR`.
 
 Sample from an EMA checkpoint:
 
@@ -50,3 +55,6 @@ Thresholded PNG masks are written to:
 ```bash
 logs/improved-diffusion/worm-mask-256-samples/png
 ```
+
+The sample wrapper removes older `samples_*.npz` files and the previous `png`
+directory before writing the latest sample batch.

@@ -42,6 +42,9 @@ SAMPLE_FLAGS=(
 )
 
 echo "OPENAI_LOGDIR=$OPENAI_LOGDIR"
+rm -f "$OPENAI_LOGDIR"/samples_*.npz
+rm -rf "$OPENAI_LOGDIR"/png
+
 python third_party/improved-diffusion/scripts/image_sample.py \
   "${MODEL_FLAGS[@]}" "${DIFFUSION_FLAGS[@]}" "${SAMPLE_FLAGS[@]}"
 
