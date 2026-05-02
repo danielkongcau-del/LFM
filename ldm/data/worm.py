@@ -126,6 +126,40 @@ class WormPairsTest(WormPairsBase):
         super().__init__(split="test", **kwargs)
 
 
+class WormJointConcatBase(WormPairsBase):
+    """Worm image/mask pairs with an additional 4-channel image+mask tensor."""
+
+    def __init__(self, concat_key="image_mask", **kwargs):
+        super().__init__(**kwargs)
+        self.concat_key = concat_key
+
+    def __getitem__(self, idx):
+        out = super().__getitem__(idx)
+        out[self.concat_key] = np.concatenate([out["image"], out["mask"]], axis=-1)
+        return out
+
+
+class WormJointConcatTrain(WormJointConcatBase):
+    def __init__(self, **kwargs):
+        kwargs.setdefault("random_crop", True)
+        kwargs.setdefault("flip_p", 0.5)
+        super().__init__(split="train", **kwargs)
+
+
+class WormJointConcatValidation(WormJointConcatBase):
+    def __init__(self, **kwargs):
+        kwargs.setdefault("random_crop", False)
+        kwargs.setdefault("flip_p", 0.0)
+        super().__init__(split="val", **kwargs)
+
+
+class WormJointConcatTest(WormJointConcatBase):
+    def __init__(self, **kwargs):
+        kwargs.setdefault("random_crop", False)
+        kwargs.setdefault("flip_p", 0.0)
+        super().__init__(split="test", **kwargs)
+
+
 class WormMaskTokenCache(Dataset):
     """Dataset for cached VQ mask tokens saved as one .npz file per sample."""
 

@@ -1,0 +1,106 @@
+model:
+  base_learning_rate: 8.0e-6
+  target: ldm.models.worm_latent_diffusion.WormLegacyJointLatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    loss_type: l2
+    first_stage_key: image_mask
+    image_size: 64
+    channels: 4
+    concat_mode: false
+    monitor: val/loss_simple_ema
+    use_ema: true
+    scale_factor: 0.20140717923641205
+    log_binarized: true
+    decoder_loss_weight: 0.05
+    decoder_image_weight: 0.25
+    decoder_mask_bce_weight: 0.5
+    decoder_mask_dice_weight: 0.5
+    decoder_loss_batch_size: 2
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 64
+        in_channels: 4
+        out_channels: 4
+        model_channels: 128
+        attention_resolutions:
+        - 8
+        - 4
+        - 2
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 3
+        - 4
+        num_head_channels: 32
+    first_stage_config:
+      target: ldm.models.paired_autoencoder.WormLegacyJointAutoencoderKL
+      params:
+        image_key: image_mask
+        embed_dim: 4
+        ckpt_path: logs/autoencoder/joint-AE-original/last.ckpt
+        log_binarized: true
+        log_samples: false
+        lossconfig:
+          target: torch.nn.Identity
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 4
+          out_ch: 4
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+    cond_stage_config: __is_unconditional__
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.worm.WormJointConcatTrain
+      params:
+        root: data/worm
+        size: 256
+        concat_key: image_mask
+    validation:
+      target: ldm.data.worm.WormJointConcatValidation
+      params:
+        root: data/worm
+        size: 256
+        concat_key: image_mask
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 500
+        max_images: 4
+        latest_only: true
+        log_validation_first_batch_only: true
+        increase_log_steps: false
+        log_images_kwargs:
+          sample: true
+          ddim_steps: 50
+          ddim_eta: 0.0
+          plot_diffusion_rows: false
+          plot_progressive_rows: false
+          plot_denoise_rows: false
+
+  trainer:
+    benchmark: true

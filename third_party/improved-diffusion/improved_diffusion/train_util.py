@@ -2,11 +2,13 @@ import copy
 import functools
 import os
 import re
+import shutil
 
 import blobfile as bf
 import numpy as np
 import torch as th
 import torch.distributed as dist
+from PIL import Image
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 
@@ -47,6 +49,16 @@ class TrainLoop:
         weight_decay=0.0,
         lr_anneal_steps=0,
         keep_latest=False,
+        sample_diffusion=None,
+        sample_interval=0,
+        sample_num_samples=16,
+        sample_batch_size=8,
+        sample_image_size=256,
+        sample_use_ddim=True,
+        sample_clip_denoised=True,
+        sample_dir="",
+        sample_keep_latest=False,
+        sample_save_raw=True,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -68,6 +80,16 @@ class TrainLoop:
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.keep_latest = keep_latest
+        self.sample_diffusion = sample_diffusion
+        self.sample_interval = sample_interval
+        self.sample_num_samples = sample_num_samples
+        self.sample_batch_size = sample_batch_size
+        self.sample_image_size = sample_image_size
+        self.sample_use_ddim = sample_use_ddim
+        self.sample_clip_denoised = sample_clip_denoised
+        self.sample_dir = sample_dir
+        self.sample_keep_latest = sample_keep_latest
+        self.sample_save_raw = sample_save_raw
 
         self.step = 0
         self.resume_step = 0
@@ -175,6 +197,12 @@ class TrainLoop:
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
+            if (
+                self.sample_interval
+                and self.step + self.resume_step > 0
+                and (self.step + self.resume_step) % self.sample_interval == 0
+            ):
+                self.sample_latest()
             self.step += 1
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
@@ -302,6 +330,108 @@ class TrainLoop:
                 self._cleanup_old_checkpoints(keep_filenames)
 
         dist.barrier()
+
+    def sample_latest(self):
+        if self.sample_diffusion is None or self.sample_num_samples <= 0:
+            return
+        if dist.get_rank() == 0:
+            logger.log(
+                "sampling {} masks at step {}...".format(
+                    self.sample_num_samples, self.step + self.resume_step
+                )
+            )
+            self._sample_latest_rank0()
+        dist.barrier()
+
+    def _sample_latest_rank0(self):
+        outdir = self.sample_dir or os.path.join(logger.get_dir(), "samples")
+        os.makedirs(outdir, exist_ok=True)
+        if self.sample_keep_latest:
+            self._cleanup_sample_dir(outdir)
+        raw_dir = os.path.join(outdir, "raw")
+        if self.sample_save_raw:
+            os.makedirs(raw_dir, exist_ok=True)
+
+        sample_fn = (
+            self.sample_diffusion.ddim_sample_loop
+            if self.sample_use_ddim
+            else self.sample_diffusion.p_sample_loop
+        )
+        current_params = [param.detach().clone() for param in self.model_params]
+        was_training = self.model.training
+        masks = []
+
+        try:
+            ema_params = self.ema_params[0] if self.ema_params else self.master_params
+            self._copy_params_to_model(ema_params)
+            self.model.eval()
+
+            written = 0
+            while written < self.sample_num_samples:
+                batch_size = min(
+                    max(1, self.sample_batch_size),
+                    self.sample_num_samples - written,
+                )
+                sample = sample_fn(
+                    self.model,
+                    (batch_size, 3, self.sample_image_size, self.sample_image_size),
+                    clip_denoised=self.sample_clip_denoised,
+                    model_kwargs={},
+                )
+                sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+                sample = sample.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+
+                for i, raw in enumerate(sample):
+                    index = written + i
+                    gray = raw.mean(axis=2)
+                    mask = (gray > 127.5).astype(np.uint8) * 255
+                    Image.fromarray(mask, mode="L").save(
+                        os.path.join(outdir, "{:06d}_mask.png".format(index))
+                    )
+                    masks.append(mask)
+                    if self.sample_save_raw:
+                        Image.fromarray(raw, mode="RGB").save(
+                            os.path.join(raw_dir, "{:06d}_raw.png".format(index))
+                        )
+                written += batch_size
+
+            if masks:
+                self._save_sample_grid(masks, os.path.join(outdir, "grid.png"))
+            logger.log("samples written to {}".format(outdir))
+        finally:
+            for param, saved in zip(self.model_params, current_params):
+                param.detach().copy_(saved)
+            if was_training:
+                self.model.train()
+
+    @staticmethod
+    def _cleanup_sample_dir(outdir):
+        raw_dir = os.path.join(outdir, "raw")
+        if os.path.isdir(raw_dir):
+            shutil.rmtree(raw_dir)
+        for name in os.listdir(outdir):
+            path = os.path.join(outdir, name)
+            if name == "grid.png" or name.endswith("_mask.png"):
+                os.remove(path)
+
+    def _copy_params_to_model(self, params):
+        if self.use_fp16:
+            master_params_to_model_params(self.model_params, params)
+            return
+        for param, source in zip(self.model_params, params):
+            param.detach().copy_(source.detach())
+
+    @staticmethod
+    def _save_sample_grid(masks, out_path):
+        columns = int(np.ceil(np.sqrt(len(masks))))
+        rows = int(np.ceil(len(masks) / columns))
+        height, width = masks[0].shape
+        grid = Image.new("L", (columns * width, rows * height), 0)
+        for index, mask in enumerate(masks):
+            x = (index % columns) * width
+            y = (index // columns) * height
+            grid.paste(Image.fromarray(mask, mode="L"), (x, y))
+        grid.save(out_path)
 
     @staticmethod
     def _is_checkpoint_filename(name):

@@ -1,0 +1,6 @@
+model:
+  params:
+    ckpt_path: logs/generator/original/last.ckpt
+    ignore_keys:
+    - model.diffusion_model.label_emb
+    - model_ema.diffusion_modellabel_emb

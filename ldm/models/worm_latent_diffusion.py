@@ -851,3 +851,193 @@ class WormJointLatentDiffusion(LatentDiffusion):
                 self.first_stage_model.logits_to_mask(decoded_samples["mask_logits"])
             )
         return log
+
+
+class WormLegacyJointLatentDiffusion(LatentDiffusion):
+    """Unconditional LDM over the legacy 4-channel image+mask AutoencoderKL latent."""
+
+    @staticmethod
+    def mask_to_rgb(mask):
+        if mask.shape[1] != 1:
+            mask = mask[:, :1]
+        return mask.repeat(1, 3, 1, 1)
+
+    @staticmethod
+    def split_joint(x):
+        if x.shape[1] < 4:
+            raise ValueError("Expected at least 4 channels for image+mask, got {}".format(tuple(x.shape)))
+        return x[:, :3], x[:, 3:4]
+
+    @staticmethod
+    def mask_from_channel(mask_channel, binarized=True):
+        if binarized:
+            return torch.where(mask_channel > 0.0, torch.ones_like(mask_channel), -torch.ones_like(mask_channel))
+        return torch.clamp(mask_channel, -1.0, 1.0)
+
+    def __init__(
+            self,
+            *args,
+            log_binarized=True,
+            decoder_loss_weight=0.0,
+            decoder_image_weight=1.0,
+            decoder_mask_bce_weight=1.0,
+            decoder_mask_dice_weight=1.0,
+            decoder_loss_batch_size=None,
+            **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if self.model.conditioning_key is not None:
+            raise NotImplementedError("WormLegacyJointLatentDiffusion is intended for unconditional training.")
+        self.log_binarized = log_binarized
+        self.decoder_loss_weight = decoder_loss_weight
+        self.decoder_image_weight = decoder_image_weight
+        self.decoder_mask_bce_weight = decoder_mask_bce_weight
+        self.decoder_mask_dice_weight = decoder_mask_dice_weight
+        self.decoder_loss_batch_size = decoder_loss_batch_size
+
+    def _log_joint(self, log, prefix, x, binarized_mask=True):
+        image, mask = self.split_joint(x)
+        log["{}_image".format(prefix)] = image
+        log["{}_mask".format(prefix)] = self.mask_to_rgb(
+            self.mask_from_channel(mask, binarized=binarized_mask)
+        )
+
+    def init_from_ckpt(self, path, ignore_keys=list(), only_model=False):
+        sd = trusted_torch_load(path, map_location="cpu")
+        if "state_dict" in list(sd.keys()):
+            sd = sd["state_dict"]
+        keys = list(sd.keys())
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+        missing, unexpected = self.load_state_dict(sd, strict=False) if not only_model else self.model.load_state_dict(
+            sd, strict=False)
+        print("Restored from {} with {} missing and {} unexpected keys".format(path, len(missing), len(unexpected)))
+        if len(missing) > 0:
+            print("Missing Keys: {}".format(missing))
+        if len(unexpected) > 0:
+            print("Unexpected Keys: {}".format(unexpected))
+
+    @staticmethod
+    def dice_loss(logits, target, eps=1.0e-6):
+        probs = torch.sigmoid(logits)
+        dims = (1, 2, 3)
+        intersection = torch.sum(probs * target, dim=dims)
+        denom = torch.sum(probs, dim=dims) + torch.sum(target, dim=dims)
+        dice = (2.0 * intersection + eps) / (denom + eps)
+        return 1.0 - dice.mean()
+
+    def decode_first_stage_with_grad(self, z):
+        z = 1.0 / self.scale_factor * z
+        return self.first_stage_model.decode(z)
+
+    def decoder_guidance_loss(self, x_start, x0_pred, prefix):
+        if self.decoder_loss_weight <= 0.0:
+            zero = torch.zeros((), device=x_start.device, dtype=x_start.dtype)
+            return zero, {
+                "{}/decoder_loss".format(prefix): zero,
+                "{}/decoder_image_l1".format(prefix): zero,
+                "{}/decoder_mask_bce".format(prefix): zero,
+                "{}/decoder_mask_dice".format(prefix): zero,
+            }
+
+        if self.decoder_loss_batch_size is not None and self.decoder_loss_batch_size > 0:
+            n = min(int(self.decoder_loss_batch_size), x_start.shape[0])
+            x_start = x_start[:n]
+            x0_pred = x0_pred[:n]
+
+        with torch.no_grad():
+            target_joint = self.decode_first_stage_with_grad(x_start)
+        pred_joint = self.decode_first_stage_with_grad(x0_pred)
+        target_image, target_mask = self.split_joint(target_joint)
+        pred_image, pred_mask = self.split_joint(pred_joint)
+        target_mask = (target_mask > 0.0).float()
+
+        image_l1 = F.l1_loss(pred_image, target_image)
+        mask_bce = F.binary_cross_entropy_with_logits(pred_mask, target_mask)
+        mask_dice = self.dice_loss(pred_mask, target_mask)
+        decoder_loss = (
+            self.decoder_image_weight * image_l1
+            + self.decoder_mask_bce_weight * mask_bce
+            + self.decoder_mask_dice_weight * mask_dice
+        )
+        weighted_loss = self.decoder_loss_weight * decoder_loss
+        return weighted_loss, {
+            "{}/decoder_loss".format(prefix): weighted_loss.detach(),
+            "{}/decoder_image_l1".format(prefix): image_l1.detach(),
+            "{}/decoder_mask_bce".format(prefix): mask_bce.detach(),
+            "{}/decoder_mask_dice".format(prefix): mask_dice.detach(),
+        }
+
+    def p_losses(self, x_start, cond, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, cond)
+
+        loss_dict = {}
+        prefix = "train" if self.training else "val"
+
+        if self.parameterization == "x0":
+            target = x_start
+            x0_pred = model_output
+        elif self.parameterization == "eps":
+            target = noise
+            x0_pred = self.predict_start_from_noise(x_noisy, t=t, noise=model_output)
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+        loss_dict.update({"{}/loss_simple".format(prefix): loss_simple.mean()})
+
+        logvar_t = self.logvar[t].to(self.device)
+        loss = loss_simple / torch.exp(logvar_t) + logvar_t
+        if self.learn_logvar:
+            loss_dict.update({"{}/loss_gamma".format(prefix): loss.mean()})
+            loss_dict.update({"logvar": self.logvar.data.mean()})
+
+        loss = self.l_simple_weight * loss.mean()
+
+        loss_vlb = self.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+        loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+        loss_dict.update({"{}/loss_vlb".format(prefix): loss_vlb})
+        loss += self.original_elbo_weight * loss_vlb
+
+        decoder_loss, decoder_log = self.decoder_guidance_loss(x_start, x0_pred, prefix)
+        loss += decoder_loss
+        loss_dict.update(decoder_log)
+        loss_dict.update({"{}/loss".format(prefix): loss})
+
+        return loss, loss_dict
+
+    @torch.no_grad()
+    def log_images(self, batch, N=4, n_row=4, sample=True, ddim_steps=100, ddim_eta=0.0,
+                   plot_diffusion_rows=False, plot_progressive_rows=False, **kwargs):
+        log = dict()
+        z, c, x, xrec, _ = self.get_input(
+            batch,
+            self.first_stage_key,
+            return_first_stage_outputs=True,
+            force_c_encode=True,
+            return_original_cond=True,
+            bs=N,
+        )
+        N = min(x.shape[0], N)
+        self._log_joint(log, "inputs", x[:N], binarized_mask=True)
+        self._log_joint(log, "reconstructions", xrec[:N], binarized_mask=self.log_binarized)
+
+        if sample:
+            use_ddim = ddim_steps is not None
+            with self.ema_scope("Plotting"):
+                samples, _ = self.sample_log(
+                    cond=c,
+                    batch_size=N,
+                    ddim=use_ddim,
+                    ddim_steps=ddim_steps,
+                    eta=ddim_eta,
+                )
+            decoded_samples = self.decode_first_stage(samples)
+            self._log_joint(log, "samples", decoded_samples, binarized_mask=self.log_binarized)
+        return log

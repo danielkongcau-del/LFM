@@ -1,0 +1,62 @@
+model:
+  base_learning_rate: 4.5e-6
+  target: ldm.models.paired_autoencoder.WormLegacyJointAutoencoderKL
+  params:
+    monitor: val/rec_loss
+    image_key: image_mask
+    embed_dim: 4
+    ckpt_path: logs/autoencoder/last.ckpt
+    log_binarized: true
+    log_samples: false
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 1.0e-6
+        disc_weight: 0.5
+        disc_in_channels: 4
+        perceptual_weight: 0.0
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 256
+      in_channels: 4
+      out_ch: 4
+      ch: 128
+      ch_mult: [1, 2, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 4
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.worm.WormJointConcatTrain
+      params:
+        root: data/worm
+        size: 256
+        concat_key: image_mask
+    validation:
+      target: ldm.data.worm.WormJointConcatValidation
+      params:
+        root: data/worm
+        size: 256
+        concat_key: image_mask
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 250
+        max_images: 4
+        latest_only: true
+        log_validation_first_batch_only: true
+        increase_log_steps: false
+
+  trainer:
+    benchmark: true

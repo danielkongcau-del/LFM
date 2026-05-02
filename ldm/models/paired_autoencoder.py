@@ -6,6 +6,7 @@ import pytorch_lightning as pl
 
 from ldm.modules.diffusionmodules.model import Encoder, Decoder
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
+from ldm.models.autoencoder import AutoencoderKL
 
 
 def _copy_ddconfig(ddconfig, in_channels=None, out_ch=None, double_z=None):
@@ -341,6 +342,263 @@ class ConcatAutoencoderKL(PairedAutoencoderKLBase):
             "image": rec[:, :3],
             "mask_logits": rec[:, 3:4],
         }
+
+
+class WormLegacyJointAutoencoderKL(AutoencoderKL):
+    """4-channel AutoencoderKL wrapper for legacy image+mask checkpoints."""
+
+    def __init__(self, *args, log_binarized=True, log_samples=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log_binarized = log_binarized
+        self.log_samples = log_samples
+
+    @staticmethod
+    def mask_to_rgb(mask):
+        if mask.shape[1] != 1:
+            mask = mask[:, :1]
+        return mask.repeat(1, 3, 1, 1)
+
+    @staticmethod
+    def split_joint(x):
+        if x.shape[1] < 4:
+            raise ValueError("Expected at least 4 channels for image+mask, got {}".format(tuple(x.shape)))
+        return x[:, :3], x[:, 3:4]
+
+    @staticmethod
+    def mask_from_channel(mask_channel, binarized=True):
+        if binarized:
+            return torch.where(mask_channel > 0.0, torch.ones_like(mask_channel), -torch.ones_like(mask_channel))
+        return torch.clamp(mask_channel, -1.0, 1.0)
+
+    def batch_to_inputs(self, batch, device=None):
+        x = self.get_input(batch, self.image_key)
+        image, mask = self.split_joint(x)
+        if device is not None:
+            image = image.to(device)
+            mask = mask.to(device)
+        return image, mask
+
+    @torch.no_grad()
+    def log_images(self, batch, only_inputs=False, **kwargs):
+        log = dict()
+        x = self.get_input(batch, self.image_key).to(self.device)
+        image, mask = self.split_joint(x)
+        log["inputs_image"] = image
+        log["inputs_mask"] = self.mask_to_rgb(self.mask_from_channel(mask, binarized=True))
+        if only_inputs:
+            return log
+
+        reconstruction, posterior = self(x, sample_posterior=False)
+        rec_image, rec_mask = self.split_joint(reconstruction)
+        log["reconstructions_image"] = rec_image
+        log["reconstructions_mask"] = self.mask_to_rgb(
+            self.mask_from_channel(rec_mask, binarized=self.log_binarized)
+        )
+        if self.log_samples:
+            samples = self.decode(torch.randn_like(posterior.mean))
+            sample_image, sample_mask = self.split_joint(samples)
+            log["samples_image"] = sample_image
+            log["samples_mask"] = self.mask_to_rgb(self.mask_from_channel(sample_mask, binarized=True))
+        return log
+
+
+class WormJointAutoencoderKL(PairedAutoencoderKLBase):
+    """Joint RGB+mask KL autoencoder with explicit modality reconstruction losses."""
+
+    def __init__(
+            self,
+            ddconfig,
+            embed_dim,
+            image_l1_weight=1.0,
+            perceptual_weight=0.0,
+            foreground_image_weight=1.0,
+            mask_bce_weight=1.0,
+            mask_dice_weight=1.0,
+            mask_boundary_weight=0.2,
+            mask_pos_weight=None,
+            log_binarized=True,
+            log_samples=False,
+            **kwargs,
+    ):
+        learn_log_scales = kwargs.pop("learn_log_scales", False)
+        super().__init__(
+            ddconfig=ddconfig,
+            embed_dim=embed_dim,
+            learn_log_scales=learn_log_scales,
+            mask_pos_weight=mask_pos_weight,
+            **kwargs,
+        )
+        z_channels = int(ddconfig["z_channels"])
+        enc_config = _copy_ddconfig(ddconfig, in_channels=4, double_z=True)
+        dec_config = _copy_ddconfig(ddconfig, out_ch=4)
+
+        self.encoder = Encoder(**enc_config)
+        self.decoder = Decoder(**dec_config)
+        self.quant_conv = nn.Conv2d(2 * z_channels, 2 * embed_dim, 1)
+        self.post_quant_conv = nn.Conv2d(embed_dim, z_channels, 1)
+        self.image_l1_weight = image_l1_weight
+        self.perceptual_weight = perceptual_weight
+        self.foreground_image_weight = foreground_image_weight
+        self.mask_bce_weight = mask_bce_weight
+        self.mask_dice_weight = mask_dice_weight
+        self.mask_boundary_weight = mask_boundary_weight
+        self.log_binarized = log_binarized
+        self.log_samples = log_samples
+
+        self.perceptual_loss = None
+        if self.perceptual_weight > 0.0:
+            try:
+                import lpips
+                self.perceptual_loss = lpips.LPIPS(net="vgg").eval()
+            except ImportError as exc:
+                try:
+                    from taming.modules.losses.lpips import LPIPS
+                except ImportError:
+                    raise ImportError(
+                        "WormJointAutoencoderKL with perceptual_weight > 0 requires "
+                        "the lpips package or taming-transformers. Install the repo "
+                        "dependencies or set model.params.perceptual_weight=0.0."
+                    ) from exc
+                self.perceptual_loss = LPIPS().eval()
+            for param in self.perceptual_loss.parameters():
+                param.requires_grad = False
+
+        self.init_pending_ckpt()
+
+    @staticmethod
+    def boundary_map(mask):
+        dilated = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        eroded = -F.max_pool2d(-mask, kernel_size=3, stride=1, padding=1)
+        return torch.clamp(dilated - eroded, 0.0, 1.0)
+
+    @classmethod
+    def boundary_loss(cls, logits, target):
+        probs = torch.sigmoid(logits)
+        return F.l1_loss(cls.boundary_map(probs), cls.boundary_map(target))
+
+    @staticmethod
+    def logits_to_mask(logits, threshold=0.5):
+        probs = torch.sigmoid(logits)
+        return torch.where(probs > threshold, torch.ones_like(probs), -torch.ones_like(probs))
+
+    def batch_to_inputs(self, batch, device=None):
+        image, mask = self.get_input(batch)
+        if device is not None:
+            image = image.to(device)
+            mask = mask.to(device)
+        return image, mask
+
+    def encode(self, image, mask):
+        h = self.encoder(torch.cat([image, mask], dim=1))
+        moments = self.quant_conv(h)
+        return DiagonalGaussianDistribution(moments)
+
+    @torch.no_grad()
+    def encode_mode(self, image, mask):
+        return self.encode(image, mask).mode()
+
+    def decode(self, z):
+        h = self.post_quant_conv(z)
+        rec = self.decoder(h)
+        return {
+            "image": rec[:, :3],
+            "mask_logits": rec[:, 3:4],
+        }
+
+    def paired_loss(self, image, mask, outputs, posterior, split="train"):
+        image_rec = outputs["image"]
+        mask_logits = outputs["mask_logits"]
+        target = self.mask_target(mask)
+
+        abs_image_error = torch.abs(image_rec - image)
+        image_l1 = abs_image_error.mean()
+        foreground_den = (target.sum() * image.shape[1]).clamp_min(1.0)
+        foreground_image_l1 = (abs_image_error * target).sum() / foreground_den
+        if self.perceptual_loss is None:
+            perceptual_loss = torch.zeros((), device=image.device, dtype=image.dtype)
+        else:
+            perceptual_loss = self.perceptual_loss(image.contiguous(), image_rec.contiguous()).mean()
+
+        pos_weight = None
+        if self.mask_pos_weight is not None:
+            pos_weight = torch.tensor([self.mask_pos_weight], device=mask_logits.device, dtype=mask_logits.dtype)
+        mask_bce = F.binary_cross_entropy_with_logits(mask_logits, target, pos_weight=pos_weight)
+        mask_dice = self.dice_loss(mask_logits, target)
+        mask_boundary = (
+            self.boundary_loss(mask_logits, target)
+            if self.mask_boundary_weight > 0.0
+            else torch.zeros((), device=image.device, dtype=image.dtype)
+        )
+        kl_loss = posterior.kl().mean()
+
+        image_loss = (
+            self.image_l1_weight * image_l1
+            + self.foreground_image_weight * foreground_image_l1
+            + self.perceptual_weight * perceptual_loss
+        )
+        mask_loss = (
+            self.mask_bce_weight * mask_bce
+            + self.mask_dice_weight * mask_dice
+            + self.mask_boundary_weight * mask_boundary
+        )
+        rec_loss = image_loss + mask_loss
+        loss = rec_loss + self.kl_weight * kl_loss
+
+        with torch.no_grad():
+            probs = torch.sigmoid(mask_logits)
+            pred = (probs > 0.5).float()
+            target_bin = (target > 0.5).float()
+            intersection = torch.sum(pred * target_bin, dim=(1, 2, 3))
+            union = torch.sum((pred + target_bin) > 0.0, dim=(1, 2, 3)).float()
+            mask_iou = ((intersection + 1.0e-6) / (union + 1.0e-6)).mean()
+            mask_pixel_acc = (pred == target_bin).float().mean()
+            foreground_fraction = target_bin.mean()
+
+        log = {
+            "{}/total_loss".format(split): loss.detach(),
+            "{}/rec_loss".format(split): rec_loss.detach(),
+            "{}/image_loss".format(split): image_loss.detach(),
+            "{}/mask_loss".format(split): mask_loss.detach(),
+            "{}/image_l1".format(split): image_l1.detach(),
+            "{}/foreground_image_l1".format(split): foreground_image_l1.detach(),
+            "{}/image_lpips".format(split): perceptual_loss.detach(),
+            "{}/mask_bce".format(split): mask_bce.detach(),
+            "{}/mask_dice".format(split): mask_dice.detach(),
+            "{}/mask_boundary".format(split): mask_boundary.detach(),
+            "{}/mask_iou".format(split): mask_iou.detach(),
+            "{}/mask_pixel_acc".format(split): mask_pixel_acc.detach(),
+            "{}/foreground_fraction".format(split): foreground_fraction.detach(),
+            "{}/kl_loss".format(split): kl_loss.detach(),
+        }
+        return loss, log
+
+    def get_last_layer(self):
+        return self.decoder.conv_out.weight
+
+    @torch.no_grad()
+    def log_images(self, batch, only_inputs=False, **kwargs):
+        log = dict()
+        image, mask = self.get_input(batch)
+        image = image.to(self.device)
+        mask = mask.to(self.device)
+        log["inputs_image"] = image
+        log["inputs_mask"] = self.mask_to_rgb(mask)
+        if only_inputs:
+            return log
+
+        outputs, posterior = self(image, mask, sample_posterior=False)
+        log["reconstructions_image"] = outputs["image"]
+        if self.log_binarized:
+            recon_mask = self.logits_to_mask(outputs["mask_logits"])
+        else:
+            recon_mask = torch.sigmoid(outputs["mask_logits"]) * 2.0 - 1.0
+        log["reconstructions_mask"] = self.mask_to_rgb(recon_mask)
+
+        if self.log_samples:
+            samples = self.decode(torch.randn_like(posterior.mean))
+            log["samples_image"] = samples["image"]
+            log["samples_mask"] = self.mask_to_rgb(self.logits_to_mask(samples["mask_logits"]))
+        return log
 
 
 class ModalityTokenBottleneckAutoencoderKL(PairedAutoencoderKLBase):
