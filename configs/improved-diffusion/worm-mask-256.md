@@ -10,7 +10,7 @@ Prepare data:
 python scripts/improved_diffusion/prepare_worm_mask_dataset.py \
   --root data/worm \
   --out_root data/worm-improved-diffusion-mask256 \
-  --splits train validation \
+  --splits train val \
   --size 256
 ```
 

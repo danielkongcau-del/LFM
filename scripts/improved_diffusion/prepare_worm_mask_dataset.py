@@ -1,17 +1,33 @@
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 
-def prepare_split(root, out_root, split, size):
-    src_dir = Path(root) / split / "mask"
-    if not src_dir.is_dir():
-        raise FileNotFoundError("Missing mask directory: {}".format(src_dir))
+SPLIT_ALIASES = {
+    "validation": "val",
+}
 
-    dst_dir = Path(out_root) / split
+
+def resolve_split(root, split):
+    src_dir = Path(root) / split / "mask"
+    if src_dir.is_dir():
+        return split, src_dir
+
+    alias = SPLIT_ALIASES.get(split)
+    if alias is not None:
+        alias_src_dir = Path(root) / alias / "mask"
+        if alias_src_dir.is_dir():
+            return alias, alias_src_dir
+
+    raise FileNotFoundError("Missing mask directory: {}".format(src_dir))
+
+
+def prepare_split(root, out_root, split, size):
+    source_split, src_dir = resolve_split(root, split)
+
+    dst_dir = Path(out_root) / source_split
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     paths = sorted([p for p in src_dir.iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg")])
@@ -33,7 +49,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default="data/worm")
     parser.add_argument("--out_root", default="data/worm-improved-diffusion-mask256")
-    parser.add_argument("--splits", nargs="+", default=["train", "validation"])
+    parser.add_argument("--splits", nargs="+", default=["train", "val"])
     parser.add_argument("--size", type=int, default=256)
     args = parser.parse_args()
 
