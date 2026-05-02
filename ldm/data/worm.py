@@ -3,6 +3,7 @@ import random
 
 import numpy as np
 import PIL
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -123,3 +124,50 @@ class WormPairsTest(WormPairsBase):
         kwargs.setdefault("random_crop", False)
         kwargs.setdefault("flip_p", 0.0)
         super().__init__(split="test", **kwargs)
+
+
+class WormMaskTokenCache(Dataset):
+    """Dataset for cached VQ mask tokens saved as one .npz file per sample."""
+
+    def __init__(
+            self,
+            root,
+            token_key="idx",
+            flip_key="idx_flip",
+            use_flip=True,
+    ):
+        self.root = os.path.expanduser(root)
+        self.token_key = token_key
+        self.flip_key = flip_key
+        self.use_flip = use_flip
+
+        if not os.path.isdir(self.root):
+            raise ValueError("Missing token cache directory: {}".format(self.root))
+
+        self.files = sorted(name for name in os.listdir(self.root) if name.endswith(".npz"))
+        if len(self.files) == 0:
+            raise ValueError("No .npz token cache files found in {}".format(self.root))
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        filename = self.files[index]
+        path = os.path.join(self.root, filename)
+        data = np.load(path, allow_pickle=False)
+
+        key = self.token_key
+        if self.use_flip and self.flip_key in data.files and random.random() < 0.5:
+            key = self.flip_key
+
+        if key not in data.files:
+            raise KeyError("Missing key '{}' in token cache file {}".format(key, path))
+
+        idx = np.asarray(data[key], dtype=np.int64).reshape(-1)
+        out = {
+            "idx": torch.from_numpy(idx),
+            "cache_path": path,
+        }
+        if "grid_size" in data.files:
+            out["grid_size"] = torch.as_tensor(int(np.asarray(data["grid_size"]).item()), dtype=torch.long)
+        return out

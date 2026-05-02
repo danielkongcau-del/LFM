@@ -1,0 +1,49 @@
+model:
+  base_learning_rate: 1.0e-4
+  target: ldm.models.worm_maskgit.WormMaskTokenPrior
+  params:
+    monitor: val/loss
+    vocab_size: 128
+    grid_size: 32
+    embed_dim: 256
+    n_heads: 8
+    n_layers: 8
+    dropout: 0.1
+    mask_schedule_type: cosine
+    label_smoothing: 0.05
+    weight_decay: 0.01
+    sample_steps: 12
+    sample_topk: 64
+    sample_softmax_temp: 1.0
+    sample_gumbel_temp: 4.5
+    tokenizer_config: configs/autoencoder/worm-mask-vq.yaml
+    tokenizer_ckpt:
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 16
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.worm.WormMaskTokenCache
+      params:
+        root: data/worm-mask-vq-tokens/train
+        use_flip: true
+    validation:
+      target: ldm.data.worm.WormMaskTokenCache
+      params:
+        root: data/worm-mask-vq-tokens/val
+        use_flip: false
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 500
+        max_images: 4
+        increase_log_steps: false
+
+  trainer:
+    benchmark: true
