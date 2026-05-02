@@ -1,0 +1,55 @@
+model:
+  base_learning_rate: 5.0e-5
+  target: ldm.models.worm_autoencoder.WormMaskVQAutoencoder
+  params:
+    monitor: val/rec_loss
+    n_embed: 128
+    embed_dim: 4
+    beta: 0.25
+    legacy: false
+    bce_weight: 1.0
+    dice_weight: 1.0
+    boundary_weight: 0.1
+    codebook_weight: 1.0
+    mask_pos_weight:
+    log_binarized: true
+    ddconfig:
+      double_z: false
+      z_channels: 4
+      resolution: 256
+      in_channels: 1
+      out_ch: 1
+      ch: 64
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 8
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.worm.WormPairsTrain
+      params:
+        root: data/worm
+        size: 256
+    validation:
+      target: ldm.data.worm.WormPairsValidation
+      params:
+        root: data/worm
+        size: 256
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 250
+        max_images: 4
+        increase_log_steps: false
+
+  trainer:
+    benchmark: true
