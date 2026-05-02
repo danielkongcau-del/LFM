@@ -14,6 +14,8 @@ model:
     concat_mode: false
     monitor: val/loss_simple_ema
     use_ema: true
+    image_loss_weight: 1.0
+    mask_loss_weight: 1.0
     unet_config:
       target: ldm.modules.diffusionmodules.openaimodel.WormGatedFusionUNetModel
       params:
@@ -94,7 +96,8 @@ lightning:
         increase_log_steps: false
         log_images_kwargs:
           sample: true
-          ddim_steps: 25
+          ddim_steps: 100
+          ddim_eta: 0.0
           plot_diffusion_rows: false
           plot_progressive_rows: false
 

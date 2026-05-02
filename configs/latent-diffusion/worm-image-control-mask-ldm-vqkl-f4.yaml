@@ -1,0 +1,122 @@
+model:
+  base_learning_rate: 5.0e-5
+  target: ldm.models.worm_latent_diffusion.WormImageMaskControlLatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    loss_type: l2
+    first_stage_key: image
+    cond_stage_key: mask
+    image_size: 64
+    channels: 3
+    concat_mode: false
+    monitor: val/loss_simple_ema
+    use_ema: true
+    only_mid_control: false
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.WormControlledUNetModel
+      params:
+        image_size: 64
+        in_channels: 3
+        out_channels: 3
+        model_channels: 224
+        attention_resolutions:
+        - 8
+        - 4
+        - 2
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 3
+        - 4
+        num_head_channels: 32
+        use_checkpoint: true
+    control_stage_config:
+      target: ldm.modules.diffusionmodules.openaimodel.WormGatedMaskAdapter
+      params:
+        image_size: 64
+        in_channels: 3
+        hint_channels: 4
+        model_channels: 224
+        attention_resolutions:
+        - 8
+        - 4
+        - 2
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 3
+        - 4
+        num_head_channels: 32
+        use_checkpoint: true
+    first_stage_config:
+      target: ldm.models.worm_latent_diffusion.WormJointFirstStage
+      params:
+        image_run: logs/autoencoder/worm-image-vq-f4-noattn-ft-b4
+        mask_run: logs/autoencoder/worm-mask-kl_f4-kl1e7
+        image_key: image
+        mask_key: mask
+        image_channels: 3
+        mask_channels: 4
+        normalize: true
+        mask_sample: false
+        channel_mean:
+        - -0.16852252945611496
+        - -0.030660508940614523
+        - 0.45750571905045057
+        - 0.009594585870657587
+        - 0.15406520082194675
+        - -0.07987507386210382
+        - -0.06877935213575863
+        channel_std:
+        - 1.2549284908415967
+        - 0.6439539500360667
+        - 0.8754309907461819
+        - 0.38377321943583254
+        - 0.6507245349294413
+        - 0.38065704432079595
+        - 0.36019573555457385
+    cond_stage_config: __is_unconditional__
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 2
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.worm.WormPairsTrain
+      params:
+        root: data/worm
+        size: 256
+    validation:
+      target: ldm.data.worm.WormPairsValidation
+      params:
+        root: data/worm
+        size: 256
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 500
+        max_images: 4
+        latest_only: true
+        log_validation_first_batch_only: true
+        increase_log_steps: false
+        log_images_kwargs:
+          sample: true
+          ddim_steps: 100
+          ddim_eta: 0.0
+          plot_diffusion_rows: false
+          plot_progressive_rows: false
+
+  trainer:
+    benchmark: true
+    check_val_every_n_epoch: 10

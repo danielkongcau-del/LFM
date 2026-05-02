@@ -1,6 +1,11 @@
 import argparse, os, sys, datetime, glob, importlib, csv
 import numpy as np
 import time
+
+# Avoid noisy NCCL heartbeat/TCPStore warnings during intentional shutdown.
+# Older PyTorch versions simply ignore this environment variable.
+os.environ.setdefault("TORCH_NCCL_ENABLE_MONITORING", "0")
+
 import torch
 import pytorch_lightning as pl
 
@@ -172,6 +177,33 @@ def add_local_import_paths():
             sys.path.append(taming_path)
 
 
+def get_process_rank(trainer=None):
+    if trainer is not None and hasattr(trainer, "global_rank"):
+        return trainer.global_rank
+    for key in ("RANK", "LOCAL_RANK"):
+        value = os.environ.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return 0
+
+
+def save_last_checkpoint(trainer, ckptdir):
+    if trainer is None or get_process_rank(trainer) != 0:
+        return
+    print("Summoning checkpoint.")
+    ckpt_path = os.path.join(ckptdir, "last.ckpt")
+    trainer.save_checkpoint(ckpt_path)
+
+
+def hard_exit(code=0):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 class WrappedDataset(Dataset):
     """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
 
@@ -291,10 +323,8 @@ class SetupCallback(Callback):
         self.lightning_config = lightning_config
 
     def on_keyboard_interrupt(self, trainer, pl_module):
-        if trainer.global_rank == 0:
-            print("Summoning checkpoint.")
-            ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
-            trainer.save_checkpoint(ckpt_path)
+        save_last_checkpoint(trainer, self.ckptdir)
+        hard_exit(0)
 
     def on_fit_start(self, trainer, pl_module):
         if trainer.global_rank == 0:
@@ -740,22 +770,18 @@ if __name__ == "__main__":
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
         trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
 
-        # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
-        # specify which metric is used to determine best models
+        # Checkpoint only the resumable latest state. For these experiments the
+        # monitored validation loss is a weak proxy for sample quality, so avoid
+        # writing misleading best*.ckpt files by default.
         default_modelckpt_cfg = {
             "target": "pytorch_lightning.callbacks.ModelCheckpoint",
             "params": {
                 "dirpath": ckptdir,
-                "filename": "best",
                 "verbose": True,
                 "save_last": True,
-                "save_top_k": 1,
+                "save_top_k": 0,
             }
         }
-        if hasattr(model, "monitor"):
-            print(f"Monitoring {model.monitor} as checkpoint metric.")
-            default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["mode"] = "min"
 
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
@@ -869,10 +895,24 @@ if __name__ == "__main__":
         # allow checkpointing via USR1
         def melk(*args, **kwargs):
             # run all checkpoint hooks
-            if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
-                ckpt_path = os.path.join(ckptdir, "last.ckpt")
-                trainer.save_checkpoint(ckpt_path)
+            save_last_checkpoint(trainer, ckptdir)
+
+
+        shutdown_in_progress = {"value": False}
+
+        def shutdown(*args, **kwargs):
+            if shutdown_in_progress["value"]:
+                hard_exit(1)
+            shutdown_in_progress["value"] = True
+
+            rank = get_process_rank(trainer)
+            if rank == 0:
+                try:
+                    save_last_checkpoint(trainer, ckptdir)
+                except Exception as exc:
+                    print(f"Failed to save last checkpoint during shutdown: {exc}", file=sys.stderr)
+                    hard_exit(1)
+            hard_exit(0)
 
 
         def divein(*args, **kwargs):
@@ -887,6 +927,10 @@ if __name__ == "__main__":
             signal.signal(signal.SIGUSR1, melk)
         if hasattr(signal, "SIGUSR2"):
             signal.signal(signal.SIGUSR2, divein)
+        if hasattr(signal, "SIGINT"):
+            signal.signal(signal.SIGINT, shutdown)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, shutdown)
 
         # run
         if opt.train:
