@@ -10,6 +10,7 @@
 
 import os
 import math
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import numpy as np
@@ -116,12 +117,65 @@ def checkpoint(func, inputs, params, flag):
         return func(*inputs)
 
 
+def _tensor_device_type(tensors):
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor):
+            return tensor.device.type
+    return "cuda"
+
+
+def _is_autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:
+        if device_type == "cuda":
+            return torch.is_autocast_enabled()
+    return False
+
+
+def _get_autocast_dtype(device_type):
+    if hasattr(torch, "get_autocast_dtype"):
+        try:
+            return torch.get_autocast_dtype(device_type)
+        except TypeError:
+            pass
+    if device_type == "cuda" and hasattr(torch, "get_autocast_gpu_dtype"):
+        return torch.get_autocast_gpu_dtype()
+    if device_type == "cpu" and hasattr(torch, "get_autocast_cpu_dtype"):
+        return torch.get_autocast_cpu_dtype()
+    return torch.float16
+
+
+def _autocast_context(device_type, enabled, dtype, cache_enabled):
+    if not enabled:
+        return nullcontext()
+    kwargs = {
+        "enabled": enabled,
+        "dtype": dtype,
+    }
+    if cache_enabled is not None:
+        kwargs["cache_enabled"] = cache_enabled
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type=device_type, **kwargs)
+    if device_type == "cuda" and hasattr(torch.cuda, "amp"):
+        return torch.cuda.amp.autocast(**kwargs)
+    return nullcontext()
+
+
 class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, length, *args):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        ctx.autocast_device_type = _tensor_device_type(ctx.input_tensors)
+        ctx.autocast_enabled = _is_autocast_enabled(ctx.autocast_device_type)
+        ctx.autocast_dtype = _get_autocast_dtype(ctx.autocast_device_type)
+        ctx.autocast_cache_enabled = (
+            torch.is_autocast_cache_enabled()
+            if hasattr(torch, "is_autocast_cache_enabled")
+            else None
+        )
 
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
@@ -130,7 +184,12 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
+        with torch.enable_grad(), _autocast_context(
+            ctx.autocast_device_type,
+            ctx.autocast_enabled,
+            ctx.autocast_dtype,
+            ctx.autocast_cache_enabled,
+        ):
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.
