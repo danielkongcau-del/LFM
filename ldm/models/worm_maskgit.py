@@ -179,6 +179,10 @@ class MaskGITSampler:
             softmax_temp=1.0,
             topk=None,
             base_gumbel_temp=4.5,
+            token_logits_bias=None,
+            token_logits_alpha=0.0,
+            token_confidence_bias=None,
+            token_confidence_alpha=0.0,
             device=None,
     ):
         if sampling_steps > sequence_length:
@@ -190,22 +194,28 @@ class MaskGITSampler:
         self.softmax_temp = softmax_temp
         self.topk = topk
         self.base_gumbel_temp = base_gumbel_temp
+        self.token_logits_bias = token_logits_bias
+        self.token_logits_alpha = token_logits_alpha
+        self.token_confidence_bias = token_confidence_bias
+        self.token_confidence_alpha = token_confidence_alpha
         self.gumbel = torch.distributions.Gumbel(0, 1)
         self.device = device or next(model.parameters()).device
 
     @torch.no_grad()
-    def get_model_prediction(self, idx):
+    def get_model_prediction(self, idx, token_logits_scale=0.0):
         logits = self.model(idx)
+        if self.token_logits_bias is not None and token_logits_scale > 0.0:
+            logits = logits + token_logits_scale * self.token_logits_bias.view(1, 1, -1)
         if self.topk is not None:
             cutoff, _ = torch.topk(logits, min(self.topk, logits.shape[-1]), dim=-1)
             logits = logits.masked_fill(logits < cutoff[..., [-1]], float("-inf"))
         return torch.softmax(logits / self.softmax_temp, dim=-1)
 
     @torch.no_grad()
-    def sample_one_step(self, idx, n, gumbel_temp=0.0):
+    def sample_one_step(self, idx, n, gumbel_temp=0.0, token_logits_scale=0.0, token_confidence_scale=0.0):
         batch, length = idx.shape
         mask = idx == self.mask_token_id
-        probs = self.get_model_prediction(idx)
+        probs = self.get_model_prediction(idx, token_logits_scale=token_logits_scale)
         sampled_idx = torch.multinomial(probs.reshape(batch * length, -1), num_samples=1).reshape(batch, length)
         sampled_probs = torch.gather(probs, dim=-1, index=sampled_idx[:, :, None]).reshape(batch, length)
 
@@ -214,6 +224,13 @@ class MaskGITSampler:
 
         randomness = self.gumbel.sample(sampled_probs.shape).to(sampled_probs.device)
         confidence = torch.log(sampled_probs.clamp_min(1.0e-20)) + gumbel_temp * randomness
+        if self.token_confidence_bias is not None and token_confidence_scale > 0.0:
+            confidence_bias = torch.gather(
+                self.token_confidence_bias.view(1, -1).expand(batch, -1),
+                dim=1,
+                index=sampled_idx.clamp_max(self.token_confidence_bias.numel() - 1),
+            )
+            confidence = confidence + token_confidence_scale * confidence_bias
         index = confidence.topk(length - n, dim=1).indices
         mask = mask.scatter(dim=1, index=index, src=torch.zeros_like(mask, dtype=torch.bool))
         sampled_idx = torch.where(mask, self.mask_token_id, sampled_idx)
@@ -228,7 +245,16 @@ class MaskGITSampler:
             n = min(n, length - 1 - t)
             n = max(0, n)
             gumbel_temp = self.base_gumbel_temp * (1.0 - (t + 1) / steps)
-            idx, mask = self.sample_one_step(idx, n=n, gumbel_temp=gumbel_temp)
+            decay = 1.0 - t / max(steps - 1, 1)
+            token_logits_scale = self.token_logits_alpha * decay
+            token_confidence_scale = self.token_confidence_alpha * decay
+            idx, mask = self.sample_one_step(
+                idx,
+                n=n,
+                gumbel_temp=gumbel_temp,
+                token_logits_scale=token_logits_scale,
+                token_confidence_scale=token_confidence_scale,
+            )
             yield idx, mask
 
     @torch.no_grad()
@@ -255,8 +281,16 @@ class WormMaskTokenPrior(pl.LightningModule):
             sample_topk=None,
             sample_softmax_temp=1.0,
             sample_gumbel_temp=4.5,
+            sample_token_weight_alpha=0.0,
+            sample_token_logits_alpha=None,
+            sample_token_confidence_alpha=0.0,
             tokenizer_config=None,
             tokenizer_ckpt=None,
+            token_weight_path=None,
+            token_weight_power=0.5,
+            token_weight_min=0.25,
+            token_weight_max=4.0,
+            log_reconstruction_mask_ratio=0.5,
             monitor="val/loss",
             **kwargs,
     ):
@@ -270,6 +304,16 @@ class WormMaskTokenPrior(pl.LightningModule):
         self.sample_topk = sample_topk
         self.sample_softmax_temp = sample_softmax_temp
         self.sample_gumbel_temp = sample_gumbel_temp
+        self.sample_token_weight_alpha = sample_token_weight_alpha
+        self.sample_token_logits_alpha = (
+            sample_token_weight_alpha if sample_token_logits_alpha is None else sample_token_logits_alpha
+        )
+        self.sample_token_confidence_alpha = sample_token_confidence_alpha
+        self.token_weight_path = token_weight_path
+        self.token_weight_power = token_weight_power
+        self.token_weight_min = token_weight_min
+        self.token_weight_max = token_weight_max
+        self.log_reconstruction_mask_ratio = log_reconstruction_mask_ratio
         self.monitor = monitor
         self.learning_rate = None
 
@@ -285,6 +329,7 @@ class WormMaskTokenPrior(pl.LightningModule):
         self.tokenizer_config = tokenizer_config
         self.tokenizer_ckpt = tokenizer_ckpt
         self.__dict__["_tokenizer"] = None
+        self.__dict__["_token_weights"] = None
         if tokenizer_config is not None and tokenizer_ckpt is not None:
             self._load_tokenizer(device=torch.device("cpu"))
 
@@ -299,7 +344,51 @@ class WormMaskTokenPrior(pl.LightningModule):
             tokenizer.to(device)
         return tokenizer
 
+    def _weights_from_counts(self, counts):
+        counts = torch.as_tensor(counts, dtype=torch.float32).view(-1)
+        used = counts > 0
+        weights = torch.zeros_like(counts)
+        if used.any():
+            used_counts = counts[used]
+            weights[used] = (used_counts.mean() / used_counts).pow(self.token_weight_power)
+            weights[used] = weights[used].clamp(self.token_weight_min, self.token_weight_max)
+            weights[used] = weights[used] / weights[used].mean().clamp_min(1.0e-12)
+        return weights
+
+    def _load_token_weights(self, device):
+        if not self.token_weight_path:
+            return None
+
+        weights = self.__dict__.get("_token_weights")
+        if weights is None:
+            payload = trusted_torch_load(self.token_weight_path, map_location="cpu")
+            if isinstance(payload, dict):
+                if "weights" in payload:
+                    weights = payload["weights"]
+                elif "counts" in payload:
+                    weights = self._weights_from_counts(payload["counts"])
+                else:
+                    raise ValueError(
+                        "Token weight file must contain `weights` or `counts`, got keys {}.".format(
+                            sorted(payload.keys())
+                        )
+                    )
+            else:
+                weights = payload
+
+            weights = torch.as_tensor(weights, dtype=torch.float32).view(-1)
+            if weights.numel() != self.vocab_size:
+                raise ValueError(
+                    "Expected {} token weights, got {} from {}.".format(
+                        self.vocab_size, weights.numel(), self.token_weight_path
+                    )
+                )
+            self.__dict__["_token_weights"] = weights
+
+        return weights.to(device)
+
     def on_fit_start(self):
+        self._load_token_weights(self.device)
         if self.tokenizer_config is not None and self.tokenizer_ckpt is not None:
             self._load_tokenizer(self.device)
 
@@ -341,9 +430,11 @@ class WormMaskTokenPrior(pl.LightningModule):
         logits = self(masked_idx).reshape(batch_size * length, -1)
         target = idx.reshape(-1)
         target = torch.where(mask.reshape(-1), target, torch.full_like(target, -100))
+        token_weights = self._load_token_weights(idx.device)
         loss = F.cross_entropy(
             logits,
             target,
+            weight=token_weights,
             ignore_index=-100,
             label_smoothing=self.label_smoothing,
         )
@@ -391,6 +482,11 @@ class WormMaskTokenPrior(pl.LightningModule):
 
     @torch.no_grad()
     def sample_indices(self, batch_size, sampling_steps=None, topk=None, softmax_temp=None, gumbel_temp=None):
+        token_bias = None
+        if self.sample_token_logits_alpha > 0.0 or self.sample_token_confidence_alpha > 0.0:
+            token_weights = self._load_token_weights(self.device)
+            if token_weights is not None:
+                token_bias = torch.log(token_weights.clamp_min(1.0e-6))
         sampler = MaskGITSampler(
             model=self.transformer,
             sequence_length=self.n_tokens,
@@ -398,9 +494,22 @@ class WormMaskTokenPrior(pl.LightningModule):
             softmax_temp=softmax_temp or self.sample_softmax_temp,
             topk=self.sample_topk if topk is None else topk,
             base_gumbel_temp=self.sample_gumbel_temp if gumbel_temp is None else gumbel_temp,
+            token_logits_bias=token_bias,
+            token_logits_alpha=self.sample_token_logits_alpha,
+            token_confidence_bias=token_bias,
+            token_confidence_alpha=self.sample_token_confidence_alpha,
             device=self.device,
         )
         return sampler.sample(batch_size)
+
+    @torch.no_grad()
+    def masked_reconstruct_indices(self, idx, mask_ratio=None):
+        mask_ratio = self.log_reconstruction_mask_ratio if mask_ratio is None else mask_ratio
+        mask = torch.rand(idx.shape, device=idx.device) < mask_ratio
+        masked_idx = torch.where(mask, self.transformer.mask_token_id, idx)
+        logits = self(masked_idx)
+        pred_idx = logits.argmax(dim=-1)
+        return torch.where(mask, pred_idx, idx)
 
     @staticmethod
     def mask_to_rgb(mask):
@@ -428,6 +537,10 @@ class WormMaskTokenPrior(pl.LightningModule):
             if only_inputs:
                 return log
 
+            reconstructed_idx = self.masked_reconstruct_indices(idx[:input_count])
+            log["reconstructions_mask"] = self.mask_to_rgb(
+                self.decode_indices_to_mask(reconstructed_idx, tokenizer)
+            )
             sampled_idx = self.sample_indices(input_count)
             log["samples_mask"] = self.mask_to_rgb(self.decode_indices_to_mask(sampled_idx, tokenizer))
         return log

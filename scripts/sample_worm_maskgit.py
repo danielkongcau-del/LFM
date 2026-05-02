@@ -63,6 +63,9 @@ def parse_args():
     parser.add_argument("--topk", type=int)
     parser.add_argument("--softmax_temp", type=float, default=1.0)
     parser.add_argument("--gumbel_temp", type=float, default=4.5)
+    parser.add_argument("--token_weight_path")
+    parser.add_argument("--sample_token_logits_alpha", type=float)
+    parser.add_argument("--sample_token_confidence_alpha", type=float)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
@@ -80,6 +83,13 @@ def main():
 
     device = torch.device(opt.device)
     prior = load_model(opt.prior_config, opt.prior_ckpt, device)
+    if opt.token_weight_path is not None:
+        prior.token_weight_path = opt.token_weight_path
+        prior.__dict__["_token_weights"] = None
+    if opt.sample_token_logits_alpha is not None:
+        prior.sample_token_logits_alpha = opt.sample_token_logits_alpha
+    if opt.sample_token_confidence_alpha is not None:
+        prior.sample_token_confidence_alpha = opt.sample_token_confidence_alpha
     vq = load_model(opt.vq_config, opt.vq_ckpt, device)
     vq.requires_grad_(False)
 

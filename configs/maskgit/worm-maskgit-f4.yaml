@@ -10,14 +10,22 @@ model:
     n_layers: 6
     dropout: 0.1
     mask_schedule_type: cosine
-    label_smoothing: 0.05
+    label_smoothing: 0.0
     weight_decay: 0.01
-    sample_steps: 16
+    sample_steps: 32
     sample_topk: 64
-    sample_softmax_temp: 1.0
+    sample_softmax_temp: 1.2
     sample_gumbel_temp: 4.5
+    sample_token_weight_alpha: 0.0
+    sample_token_logits_alpha: 0.15
+    sample_token_confidence_alpha: 1.0
     tokenizer_config: configs/autoencoder/worm-mask-vq-f4.yaml
     tokenizer_ckpt:
+    token_weight_path:
+    token_weight_power: 0.5
+    token_weight_min: 0.25
+    token_weight_max: 4.0
+    log_reconstruction_mask_ratio: 0.5
 
 data:
   target: main.DataModuleFromConfig

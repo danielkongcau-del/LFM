@@ -19,3 +19,11 @@ submodules, so cloud training machines can pull a single repository.
 - Snapshot: `ca5c7c39cf55d49fb034d7348595c9c3abc2c4ed`
 - License: MIT
 - Purpose: PyTorch implementation to guide the mask token prior implementation.
+
+## Improved Diffusion
+
+- Path: `third_party/improved-diffusion`
+- Upstream: https://github.com/openai/improved-diffusion
+- Snapshot: `1bc7bbbdc414d83d4abf2ad8cc1446dc36c4e4d5`
+- License: MIT
+- Purpose: pixel-space diffusion baseline for unconditional worm mask generation.
