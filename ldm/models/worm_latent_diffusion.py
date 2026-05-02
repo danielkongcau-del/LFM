@@ -1,12 +1,15 @@
 import os
 from contextlib import contextmanager
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.optim.lr_scheduler import LambdaLR
 
-from ldm.models.diffusion.ddpm import LatentDiffusion, disabled_train
+from ldm.models.diffusion.ddpm import DDPM, LatentDiffusion, disabled_train
+from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.modules.ema import LitEma
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
 from ldm.util import instantiate_from_config
@@ -323,6 +326,180 @@ class WormMaskLatentDiffusion(LatentDiffusion):
             log["samples_mask"] = self.first_stage_model.mask_to_rgb(
                 self.first_stage_model.logits_to_mask(decoded_samples["mask_logits"])
             )
+        return log
+
+
+class WormMaskNativeDiffusion(DDPM):
+    is_native_mask_prior = True
+
+    def __init__(
+            self,
+            representation="sdf",
+            mask_key="mask",
+            sdf_clip=32.0,
+            x0_loss_weight=0.0,
+            *args,
+            **kwargs,
+    ):
+        kwargs.pop("first_stage_key", None)
+        super().__init__(*args, first_stage_key=mask_key, **kwargs)
+        if representation not in ("binary", "sdf"):
+            raise ValueError("Unsupported mask representation: {}".format(representation))
+        if self.channels != 1:
+            raise ValueError("WormMaskNativeDiffusion currently expects channels=1.")
+        self.representation = representation
+        self.mask_key = mask_key
+        self.sdf_clip = float(sdf_clip)
+        self.x0_loss_weight = float(x0_loss_weight)
+
+    @staticmethod
+    def mask_to_rgb(mask):
+        if mask.shape[1] != 1:
+            mask = mask[:, :1]
+        return mask.repeat(1, 3, 1, 1)
+
+    def batch_to_mask(self, batch, device=None):
+        mask = batch[self.mask_key]
+        if len(mask.shape) == 3:
+            mask = mask[..., None]
+        mask = mask.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+        if device is not None:
+            mask = mask.to(device)
+        if mask.shape[2:] != (self.image_size, self.image_size):
+            mask = F.interpolate(mask, size=(self.image_size, self.image_size), mode="nearest")
+        return torch.where(mask > 0.0, torch.ones_like(mask), -torch.ones_like(mask))
+
+    def _mask_to_sdf(self, mask):
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "WormMaskNativeDiffusion representation='sdf' requires opencv-python."
+            ) from exc
+
+        mask_np = (mask.detach().cpu().numpy() > 0.0).astype(np.uint8)
+        fields = np.empty(mask_np.shape, dtype=np.float32)
+        for b in range(mask_np.shape[0]):
+            for c in range(mask_np.shape[1]):
+                fg = mask_np[b, c]
+                bg = 1 - fg
+                dist_in = cv2.distanceTransform(fg, cv2.DIST_L2, 5)
+                dist_out = cv2.distanceTransform(bg, cv2.DIST_L2, 5)
+                sdf = (dist_in - dist_out) / max(self.sdf_clip, 1.0e-6)
+                fields[b, c] = np.clip(sdf, -1.0, 1.0)
+        return torch.from_numpy(fields).to(device=mask.device, dtype=mask.dtype)
+
+    def mask_to_target(self, mask):
+        if self.representation == "binary":
+            return mask
+        if self.representation == "sdf":
+            return self._mask_to_sdf(mask)
+        raise NotImplementedError()
+
+    def target_to_mask(self, target):
+        return torch.where(target > 0.0, torch.ones_like(target), -torch.ones_like(target))
+
+    def get_input(self, batch, k=None):
+        mask = self.batch_to_mask(batch, device=self.device)
+        return self.mask_to_target(mask)
+
+    def apply_model(self, x_noisy, t, cond=None, return_ids=False):
+        model_output = self.model(x_noisy, t)
+        if isinstance(model_output, tuple) and not return_ids:
+            return model_output[0]
+        return model_output
+
+    def p_losses(self, x_start, t, noise=None):
+        noise = torch.randn_like(x_start) if noise is None else noise
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, None)
+
+        loss_dict = {}
+        log_prefix = "train" if self.training else "val"
+
+        if self.parameterization == "eps":
+            target = noise
+        elif self.parameterization == "x0":
+            target = x_start
+        else:
+            raise NotImplementedError()
+
+        loss_simple = self.get_loss(model_output, target, mean=False).mean(dim=[1, 2, 3])
+        loss_dict.update({f"{log_prefix}/loss_simple": loss_simple.mean()})
+        loss = loss_simple.mean() * self.l_simple_weight
+
+        loss_vlb = (self.lvlb_weights[t] * loss_simple).mean()
+        loss_dict.update({f"{log_prefix}/loss_vlb": loss_vlb})
+        loss = loss + self.original_elbo_weight * loss_vlb
+
+        if self.x0_loss_weight > 0.0:
+            if self.parameterization == "eps":
+                pred_x0 = self.predict_start_from_noise(x_noisy, t=t, noise=model_output)
+            else:
+                pred_x0 = model_output
+            loss_x0 = self.get_loss(pred_x0, x_start, mean=False).mean(dim=[1, 2, 3]).mean()
+            loss = loss + self.x0_loss_weight * loss_x0
+            loss_dict.update({f"{log_prefix}/loss_x0": loss_x0})
+
+        loss_dict.update({f"{log_prefix}/loss": loss})
+        return loss, loss_dict
+
+    @torch.no_grad()
+    def sample_log(self, cond, batch_size, ddim, ddim_steps, **kwargs):
+        if ddim:
+            ddim_sampler = DDIMSampler(self)
+            shape = (self.channels, self.image_size, self.image_size)
+            samples, intermediates = ddim_sampler.sample(
+                ddim_steps,
+                batch_size,
+                shape,
+                None,
+                verbose=False,
+                **kwargs,
+            )
+        else:
+            samples, intermediates = self.sample(batch_size=batch_size, return_intermediates=True)
+        return samples, intermediates
+
+    @torch.no_grad()
+    def sample_mask(self, batch_size, ddim=True, ddim_steps=100, eta=0.0, **kwargs):
+        samples, intermediates = self.sample_log(
+            cond=None,
+            batch_size=batch_size,
+            ddim=ddim,
+            ddim_steps=ddim_steps,
+            eta=eta,
+            **kwargs,
+        )
+        return self.target_to_mask(samples), samples, intermediates
+
+    @torch.no_grad()
+    def decode_first_stage(self, z, *args, **kwargs):
+        return {"mask": self.target_to_mask(z), "mask_field": z}
+
+    @torch.no_grad()
+    def log_images(self, batch, N=4, n_row=4, sample=True, ddim_steps=100, ddim_eta=0.0,
+                   plot_diffusion_rows=False, plot_progressive_rows=False, **kwargs):
+        log = dict()
+        mask = self.batch_to_mask(batch, device=self.device)
+        N = min(mask.shape[0], N)
+        mask = mask[:N]
+        target = self.mask_to_target(mask)
+
+        log["inputs_mask"] = self.mask_to_rgb(mask)
+        log["reconstructions_mask"] = self.mask_to_rgb(self.target_to_mask(target))
+
+        if sample:
+            use_ddim = ddim_steps is not None
+            with self.ema_scope("Plotting"):
+                samples, _ = self.sample_log(
+                    cond=None,
+                    batch_size=N,
+                    ddim=use_ddim,
+                    ddim_steps=ddim_steps,
+                    eta=ddim_eta,
+                )
+            log["samples_mask"] = self.mask_to_rgb(self.target_to_mask(samples))
         return log
 
 

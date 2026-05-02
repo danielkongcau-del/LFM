@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from PIL import Image
 
@@ -59,6 +60,38 @@ def save_pair(image_tensor, mask_tensor, path):
     canvas.save(path)
 
 
+def sample_mask_condition(mask_model, image_model, batch_size, opt):
+    if getattr(mask_model, "is_native_mask_prior", False):
+        with mask_model.ema_scope("Two-stage native mask sampling"):
+            masks, _, _ = mask_model.sample_mask(
+                batch_size=batch_size,
+                ddim=True,
+                ddim_steps=opt.ddim_steps,
+                eta=opt.ddim_eta,
+            )
+        first_stage = image_model.first_stage_model
+        mask_size = getattr(getattr(first_stage, "mask_model", None), "image_size", None)
+        if mask_size is not None and masks.shape[2:] != (mask_size, mask_size):
+            masks = F.interpolate(masks, size=(mask_size, mask_size), mode="nearest")
+        mask_z = first_stage.encode_mask(masks)
+        display_masks = first_stage.mask_to_rgb(masks)
+        return mask_z, display_masks
+
+    with mask_model.ema_scope("Two-stage mask sampling"):
+        mask_z, _ = mask_model.sample_log(
+            cond=None,
+            batch_size=batch_size,
+            ddim=True,
+            ddim_steps=opt.ddim_steps,
+            eta=opt.ddim_eta,
+        )
+    decoded_mask = mask_model.decode_first_stage(mask_z)
+    display_masks = mask_model.first_stage_model.mask_to_rgb(
+        mask_model.first_stage_model.logits_to_mask(decoded_mask["mask_logits"])
+    )
+    return mask_z, display_masks
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mask_config", default="configs/latent-diffusion/worm-mask-ldm-kl-f4.yaml")
@@ -93,14 +126,7 @@ def main():
     while written < opt.n_samples:
         batch_size = min(opt.batch_size, opt.n_samples - written)
 
-        with mask_model.ema_scope("Two-stage mask sampling"):
-            mask_z, _ = mask_model.sample_log(
-                cond=None,
-                batch_size=batch_size,
-                ddim=True,
-                ddim_steps=opt.ddim_steps,
-                eta=opt.ddim_eta,
-            )
+        mask_z, masks = sample_mask_condition(mask_model, image_model, batch_size, opt)
 
         with image_model.ema_scope("Two-stage image sampling"):
             image_z, _ = image_model.sample_log(
@@ -111,10 +137,6 @@ def main():
                 eta=opt.ddim_eta,
             )
 
-        decoded_mask = mask_model.decode_first_stage(mask_z)
-        masks = mask_model.first_stage_model.mask_to_rgb(
-            mask_model.first_stage_model.logits_to_mask(decoded_mask["mask_logits"])
-        )
         images = image_model.decode_first_stage(image_z)
 
         for i in range(batch_size):

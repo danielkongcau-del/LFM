@@ -14,5 +14,6 @@ tqdm>=4.67
 packaging>=23
 requests>=2.31
 lpips>=0.1.4
+opencv-python-headless>=4.8
 # Required for original VQ first-stage models and pretrained VQ checkpoints.
 git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
