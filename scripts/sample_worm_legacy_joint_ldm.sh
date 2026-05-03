@@ -3,6 +3,7 @@ set -euo pipefail
 
 CONFIGS="${CONFIGS:-configs/latent-diffusion/worm-legacy-joint-ldm-uncond-f4.yaml}"
 CKPT="${CKPT:-}"
+AE_CKPT="${AE_CKPT:-}"
 OUTDIR="${OUTDIR:-outputs/worm-legacy-joint-ldm-samples}"
 N_SAMPLES="${N_SAMPLES:-16}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
@@ -16,6 +17,9 @@ read -r -a CONFIG_ARGS <<< "${CONFIGS}"
 EXTRA_ARGS=()
 if [[ -n "${CKPT}" ]]; then
   EXTRA_ARGS+=("--ckpt" "${CKPT}")
+fi
+if [[ -n "${AE_CKPT}" ]]; then
+  EXTRA_ARGS+=("--ae_ckpt" "${AE_CKPT}")
 fi
 
 python scripts/sample_worm_legacy_joint_ldm.py \

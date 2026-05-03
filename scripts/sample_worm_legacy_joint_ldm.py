@@ -67,6 +67,7 @@ def parse_args():
         help="One or more configs, merged from left to right.",
     )
     parser.add_argument("--ckpt", help="Checkpoint to load after instantiating the config.")
+    parser.add_argument("--ae_ckpt", help="Override first-stage joint autoencoder checkpoint.")
     parser.add_argument("--outdir", default="outputs/worm-legacy-joint-ldm-samples")
     parser.add_argument("--n_samples", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -92,6 +93,8 @@ def main():
     config = OmegaConf.merge(*configs)
     if args.ckpt:
         config.model.params.ckpt_path = None
+    if args.ae_ckpt:
+        config.model.params.first_stage_config.params.ckpt_path = args.ae_ckpt
 
     device = torch.device(args.device)
     model = instantiate_from_config(config.model)

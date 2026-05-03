@@ -5,7 +5,6 @@ model:
     monitor: val/rec_loss
     image_key: image_mask
     embed_dim: 4
-    ckpt_path: logs/autoencoder/joint-AE-original/last.ckpt
     log_binarized: true
     log_samples: false
     lossconfig:
